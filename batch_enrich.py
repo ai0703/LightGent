@@ -41,6 +41,29 @@ from lightgent_service import settings
 PLACEHOLDER = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 
 
+def load_endpoints(path: str) -> tuple[list[str], list[str]] | None:
+    """Load a notebook registry: a JSON list of Colab sessions, each an
+    object {"llm": ".../v1", "searxng": "..."} (searxng optional) or a bare
+    LLM URL string. Returns (llm_urls, searxng_urls) or None if no file.
+
+    This is how you scale: run the notebook in N Colab tabs and append one
+    line per session here — no .env surgery."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    data = json.loads(p.read_text(encoding="utf-8"))
+    llm, sx = [], []
+    for e in data:
+        if isinstance(e, str):
+            llm.append(e)
+        elif isinstance(e, dict):
+            if e.get("llm"):
+                llm.append(e["llm"])
+            if e.get("searxng"):
+                sx.append(e["searxng"])
+    return llm, sx
+
+
 async def live_endpoints(endpoints: list[str]) -> list[str]:
     """Ping each LLM endpoint's /models; keep only the ones that answer. With
     many ephemeral Colab tunnels some are always dead — drop them up front so
@@ -116,12 +139,23 @@ async def main() -> None:
                     help="JSON Schema file defining the output object")
     ap.add_argument("--concurrency", type=int, default=None,
                     help="in-flight rows (default: 3 per endpoint)")
+    ap.add_argument("--endpoints", default="endpoints.json", metavar="FILE.json",
+                    help="notebook registry (one entry per Colab session); "
+                         "overrides .env when present")
     ap.add_argument("-o", "--out", default=None)
     args = ap.parse_args()
 
-    endpoints = settings.endpoints()
+    reg = load_endpoints(args.endpoints)
+    if reg:
+        endpoints, sx_pool = reg
+        if sx_pool:
+            settings.searxng_urls = ",".join(sx_pool)  # tools read this pool
+        print(f"registry {args.endpoints}: {len(endpoints)} LLM, {len(sx_pool)} SearXNG")
+    else:
+        endpoints = settings.endpoints()
     if not endpoints or not settings.llm_model:
-        sys.exit("Set LLM_BASE_URL (or LLM_BASE_URLS) and LLM_MODEL in .env")
+        sys.exit("No endpoints. Add endpoints.json (see endpoints.example.json) "
+                 "or set LLM_BASE_URL(S) + LLM_MODEL in .env")
     print(f"health-checking {len(endpoints)} endpoint(s)...")
     endpoints = await live_endpoints(endpoints)
     if not endpoints:

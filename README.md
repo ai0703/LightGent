@@ -52,10 +52,30 @@ as columns. It mirrors Clay's column UI:
 - **Output as Fields** (`--field NAME:DESC`, repeatable) → adds those columns
   plus `lg_confidence` / `lg_sources`, or **JSON Schema** (`--schema file.json`)
   → adds one column per top-level schema property.
-- **Multi-Colab** — set `LLM_BASE_URLS` to several tunnel URLs; rows round-robin
-  across them. Default concurrency is 3 per endpoint. One `SEARXNG_URL` is
-  shared by all.
 - Runs **in-process** (no server needed) so Claude Code can drive it directly.
+
+## Scale to 10× — run many Colab notebooks
+
+Each free Colab GPU handles ~3 concurrent agents. To go faster, run the
+notebook in **N Colab sessions** (separate tabs, or separate Google accounts)
+and register them all — the batch runner load-balances rows across every
+session and pools their SearXNG backends, so N notebooks ≈ N× throughput.
+
+The easy way is a **notebook registry**, `endpoints.json` (gitignored — copy
+`endpoints.example.json`). Each session's cell 5 prints a ready-to-paste line:
+
+```json
+[
+  {"llm": "https://session-1.trycloudflare.com/v1", "searxng": "https://s1.trycloudflare.com"},
+  {"llm": "https://session-2.trycloudflare.com/v1", "searxng": "https://s2.trycloudflare.com"}
+]
+```
+
+Then just run `batch_enrich.py` — it auto-loads `endpoints.json`,
+**health-checks every session and drops dead tunnels** (Colab sessions are
+ephemeral; some will drop), and spreads the CSV across the survivors. Use the
+**same** `LIGHTGENT_API_KEY` Colab secret in every session. Falls back to
+`.env` (`LLM_BASE_URLS` / `SEARXNG_URLS`) when there's no registry file.
 
 ## Quickstart
 
@@ -134,18 +154,29 @@ package that supports v5e — same `vllm serve` CLI, same OpenAI API.
 
 ## Caveats (read before relying on this)
 
-- **Tunnel URL rotates** on every notebook restart → update `.env` + restart
-  the service each time. A stable URL needs a *named* Cloudflare tunnel on a
-  domain you control (e.g. `llm.hivesyncai.com`) — one-time setup in the
-  Cloudflare dashboard, then replace the quick-tunnel cell with
-  `cloudflared tunnel run --token <token>`.
+- **Tunnel URL rotates** on every notebook restart → update `.env` /
+  `endpoints.json` each time. A stable URL needs a *named* Cloudflare tunnel on
+  a domain you control — one-time setup in the Cloudflare dashboard, then
+  replace the quick-tunnel cell with `cloudflared tunnel run --token <token>`.
 - **Colab sessions die**: free tier disconnects after idle/≈12 h and free-tier
   terms frown on long-running background services — fine for dev/testing and
-  batch runs you babysit, not a production backend. Production stays RunPod
-  (or the droplet). This is the $0 dev/experiment tier, not the prod tier.
-- **Concurrency**: one Colab GPU ≈ 2–4 concurrent agents max (`MAX_CONCURRENT=3`).
-- **Model quality**: T4's 4B model is noticeably weaker than the prod
-  Qwen3-30B-A3B — expect more `parse_error`/low-confidence rows. On Colab Pro
-  (L4/A100) the auto-selected bigger models close most of the gap.
+  batch runs you babysit, not a 24/7 production backend.
+- **Concurrency**: one Colab GPU ≈ 2–4 concurrent agents max (`MAX_CONCURRENT=3`);
+  scale out with more notebooks (see "Scale to 10×") rather than up.
+- **Model quality**: the T4's 4B model is weaker than a big model — expect more
+  `parse_error`/low-confidence rows. On Colab Pro (L4/A100) the auto-selected
+  bigger models close most of the gap.
 - **Secrets**: the tunnel is public — anyone with URL + API key uses your GPU.
-  Keep the API key real, don't commit `.env`.
+  Set a real `LIGHTGENT_API_KEY` (Colab secret), never commit `.env` /
+  `endpoints.json`.
+
+## Proxy (recommended)
+
+SearXNG scrapes Google/Bing/DuckDuckGo/Brave, and Colab's shared IPs get
+CAPTCHA'd fast — a residential proxy fixes it (set `SEARXNG_PROXY` as a Colab
+secret). A cheap option that's been verified working here:
+[Proxiware](https://proxiware.com) **Eco Residential — ~$3 per 10 GB**
+(`socks5h://user-...-network-eco:pass@proxy.proxiware.com:1337`). Use the
+**rotating** (`-network-eco`, no `-session-…`) credential so each request gets
+a fresh IP. Search traffic is light, so 10 GB goes a long way. Without a proxy,
+only a weak Google wrapper survives and `site:`/exact-match results degrade.

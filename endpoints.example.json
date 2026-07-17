@@ -1,0 +1,4 @@
+[
+  {"llm": "https://session-1-xxxx.trycloudflare.com/v1", "searxng": "https://session-1-yyyy.trycloudflare.com"},
+  {"llm": "https://session-2-xxxx.trycloudflare.com/v1", "searxng": "https://session-2-yyyy.trycloudflare.com"}
+]
