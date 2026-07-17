@@ -1,0 +1,486 @@
+"""LightGent — a lightweight Claygent clone: web-research enrichment agent.
+
+Adapted from local-enrichos/services/enrich-service (agent.py / tools.py /
+config.py). Same battle-tested loop: OpenAI-compatible endpoint via env-driven
+base URL, parallel tool dispatch, <tool_call> tag fallback for vLLM servers
+without a tool parser, force-conclude near the iteration cap, and
+bracket-balanced JSON extraction from messy OSS-model output.
+
+Difference vs enrich-service: the task, context, and output fields are
+request-driven (like a Claygent column) instead of hardcoded employee research.
+
+Run:  uvicorn lightgent_service:app --host 0.0.0.0 --port 8100
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import random
+import re
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+
+import httpx
+from fastapi import FastAPI
+from openai import AsyncOpenAI, BadRequestError, InternalServerError
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("lightgent")
+
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # OpenAI-compatible endpoint — point at the Colab Cloudflare tunnel
+    # (https://xxxx.trycloudflare.com/v1), RunPod, Ollama (/v1), anything.
+    llm_base_url: str = ""
+    # Pool of endpoints for multi-Colab parallelism (comma-separated, each
+    # ending in /v1). When set, the batch runner round-robins rows across them
+    # for N-times throughput. Falls back to llm_base_url when empty.
+    llm_base_urls: str = ""
+    llm_api_key: str = "none"
+    llm_model: str = ""
+
+    searxng_url: str = ""
+    # Pool of SearXNG endpoints (comma-separated). With many Colab sessions you
+    # have many search backends — spread search load and survive one dying.
+    # Falls back to searxng_url.
+    searxng_urls: str = ""
+    searxng_token: str = ""
+
+    # Optional comma-separated SOCKS5 proxies for Jina fetches (empty = direct)
+    jina_proxies: str = ""
+
+    max_iterations: int = 12
+    llm_timeout: int = 180
+    tool_timeout: int = 45
+    # A single Colab GPU chokes fast — keep in-flight LLM calls low.
+    max_concurrent: int = 3
+
+    fetch_truncate: int = 2500
+
+    def endpoints(self) -> list[str]:
+        """All LLM endpoints to spread work across (pool, else the single URL)."""
+        pool = [u.strip() for u in self.llm_base_urls.split(",") if u.strip()]
+        return pool or ([self.llm_base_url] if self.llm_base_url else [])
+
+    def searxng_endpoints(self) -> list[str]:
+        """All SearXNG endpoints (pool, else the single URL)."""
+        pool = [u.strip().rstrip("/") for u in self.searxng_urls.split(",") if u.strip()]
+        return pool or ([self.searxng_url.rstrip("/")] if self.searxng_url else [])
+
+
+settings = Settings()
+llm_semaphore = asyncio.Semaphore(settings.max_concurrent)
+
+
+# ── Schemas ───────────────────────────────────────────────────────────────
+
+class ResearchRequest(BaseModel):
+    task: str = Field(..., description="What to research, in plain English")
+    context: dict[str, Any] = Field(default_factory=dict,
+                                    description="The row being enriched, e.g. {company, domain, city}")
+    output_fields: dict[str, str] = Field(default_factory=dict,
+                                          description="field name -> description of what to put there")
+    max_iterations: int | None = None
+
+
+class ResearchResponse(BaseModel):
+    status: Literal["success", "parse_error", "error"]
+    data: Any = None
+    iterations: int = 0
+    tool_calls: int = 0
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web and return a list of results (url, title, snippet).",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch the full content of a webpage as readable text.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "Full URL to fetch"}},
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+
+async def web_search(query: str, http: httpx.AsyncClient) -> str:
+    pool = settings.searxng_endpoints()
+    base = random.choice(pool) if pool else ""
+    url = f"{base}/search"
+    headers = {}
+    if settings.searxng_token:
+        headers["Authorization"] = f"Bearer {settings.searxng_token}"
+    resp = await http.get(url, params={"q": query, "format": "json"}, headers=headers)
+    if resp.status_code >= 400:
+        log.warning("searxng %d query=%r", resp.status_code, query[:80])
+    resp.raise_for_status()
+    results = resp.json().get("results", [])
+    return json.dumps([
+        {
+            "url": r.get("url"),
+            "title": (r.get("title") or "")[:120],
+            "snippet": (r.get("content") or "")[:240],
+        }
+        for r in results[:6]
+    ])
+
+
+async def web_fetch(url: str) -> str:
+    """Fetch a page as readable text via Jina reader, optional proxies first."""
+    if "r.jina.ai/" in url:
+        url = url.split("r.jina.ai/", 1)[-1]
+    jina_url = f"https://r.jina.ai/{url}"
+    headers = {"Accept": "text/plain"}
+
+    proxies = [p.strip() for p in settings.jina_proxies.split(",") if p.strip()]
+    for proxy in proxies:
+        try:
+            async with httpx.AsyncClient(proxy=proxy, timeout=settings.tool_timeout) as client:
+                resp = await client.get(jina_url, headers=headers)
+                if resp.status_code >= 400:
+                    continue
+                return resp.text[: settings.fetch_truncate]
+        except Exception as e:
+            log.warning("jina via proxy failed: %s url=%s", e, url[:80])
+            continue
+
+    async with httpx.AsyncClient(timeout=settings.tool_timeout) as client:
+        resp = await client.get(jina_url, headers=headers)
+        resp.raise_for_status()
+        return resp.text[: settings.fetch_truncate]
+
+
+async def _dispatch(tc: dict, http: httpx.AsyncClient) -> str:
+    name = tc["function"]["name"]
+    try:
+        args = json.loads(tc["function"]["arguments"] or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    try:
+        if name == "web_search":
+            return await web_search(args.get("query", ""), http)
+        if name == "web_fetch":
+            return await web_fetch(args.get("url", ""))
+        return f"Unknown tool: {name}"
+    except Exception as e:
+        return f"Tool error ({name}): {e}"
+
+
+# ── Parsing helpers (same tricks as enrich-service) ───────────────────────
+
+def _parse_tag_tool_calls(content: str) -> list[dict]:
+    """Parse <tool_call>...</tool_call> tags emitted when vLLM tool parser is missing."""
+    matches = re.findall(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL)
+    result = []
+    for i, m in enumerate(matches):
+        try:
+            data = json.loads(m.strip())
+            result.append({
+                "id": f"tag_{i}",
+                "type": "function",
+                "function": {
+                    "name": data.get("name", ""),
+                    "arguments": json.dumps(data.get("arguments", data.get("parameters", {}))),
+                },
+            })
+        except json.JSONDecodeError:
+            pass
+    return result
+
+
+def _normalise_tool_calls(msg: Any) -> list[dict]:
+    if not msg.tool_calls:
+        return []
+    return [
+        {
+            "id": tc.id,
+            "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+        }
+        for tc in msg.tool_calls
+    ]
+
+
+def _balanced_slice(text: str, open_ch: str, close_ch: str) -> str | None:
+    """Walk back from the last close_ch balancing brackets to the matching open_ch."""
+    end = text.rfind(close_ch)
+    if end == -1:
+        return None
+    depth = 0
+    for i in range(end, -1, -1):
+        ch = text[i]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return text[i : end + 1]
+    return None
+
+
+def _extract_json(content: str) -> Any:
+    """Extract the last balanced JSON object or array from model output.
+
+    Handles markdown fences, explanatory prose before/after, and nested
+    structures. Returns None when nothing parseable is found."""
+    if not content:
+        return None
+    cleaned = re.sub(r"```(?:json)?\s*", "", content)
+    cleaned = re.sub(r"\s*```", "", cleaned)
+    candidates: list[tuple[int, Any]] = []
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        s = _balanced_slice(cleaned, open_ch, close_ch)
+        if not s:
+            continue
+        try:
+            candidates.append((cleaned.rfind(close_ch), json.loads(s)))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c[0])[1]
+
+
+# ── Prompt ────────────────────────────────────────────────────────────────
+
+# The general research methodology. Task-agnostic on purpose: it works for ANY
+# goal the user's prompt states (what a company sells, B2B vs B2C, tech stack,
+# a person's role, pricing, headcount, a LinkedIn URL, …). Because the method
+# lives here, the per-row task prompt can stay short — the user should NOT have
+# to re-explain how to search; they just say WHAT they want.
+RESEARCH_METHOD = """You are LightGent, a general web-research agent. You are \
+given a SUBJECT (a row of data) and a TASK, and you fill the requested OUTPUT \
+FIELDS with accurate, verified facts gathered from the web using the \
+web_search and web_fetch tools.
+
+## How to research (applies to any task)
+1. PLAN per field. For each output field, decide what evidence answers it and \
+where that evidence most likely lives — the subject's own website (home, \
+/about, /products, /services, /pricing, /solutions, /customers, /contact, \
+/team), an official registry, a store/marketplace listing, news, a directory, \
+or a profile site. Different fields need different sources.
+2. PRIMARY SOURCE FIRST. If a website/domain is known, fetch the most relevant \
+pages for the task IN PARALLEL before searching. The company's own site is the \
+best evidence for what it does, sells, and offers.
+3. SEARCH for what the site didn't answer. Use plain keywords — DO NOT use \
+quotation marks (the search backend ignores quotes, so a quoted phrase returns \
+unrelated results). Use site: to constrain a source (e.g. site:linkedin.com/in \
+for a person's profile). Read the result snippets before fetching a page.
+4. SEARCH THE SPECIFIC THING, not a generic category. To find an attribute of \
+a named entity, search that entity by name — e.g. once you learn a person's \
+name, search THAT NAME + company (not "company + job title", which surfaces the \
+wrong people); to find a product's price, search the product name + pricing.
+5. CORROBORATE. Prefer primary/official sources. For a claim not stated by the \
+subject itself, confirm it with a second source when you can.
+
+## Accuracy (hard rules — these matter more than completeness)
+- NEVER fabricate. If a field is not supported by something you actually read, \
+set it to null. Do not guess.
+- Only output URLs, names, emails, numbers, and facts that appeared in a tool \
+result. Never construct or guess a URL or an email from a pattern.
+- Each field must contain EXACTLY what it asks for. A near-miss substitute is \
+wrong — use null instead (e.g. if a personal profile is asked for, a company \
+page is not an acceptable substitute).
+- Before setting a field to null, run at least one targeted search for it. Null \
+is only allowed after a genuine search came up empty.
+
+## Efficiency
+- PARALLEL TOOL CALLS: request independent lookups together in ONE turn.
+- STOP EARLY: as soon as every field is filled (or confirmed unfindable), answer.
+- You have a hard tool-call budget — do not loop or repeat searches."""
+
+
+def build_system_prompt(task: str, context: dict[str, Any],
+                        output_fields: dict[str, str]) -> str:
+    ctx_lines = "\n".join(f"- {k}: {v}" for k, v in context.items() if v) or "- (none provided)"
+    if output_fields:
+        field_lines = ",\n".join(f'  "{k}": <{v}, or null if not verifiable>'
+                                 for k, v in output_fields.items())
+    else:
+        field_lines = '  "answer": <the answer to the task, or null if not verifiable>'
+    return f"""{RESEARCH_METHOD}
+
+## Task
+{task}
+
+## Subject (the row being researched)
+{ctx_lines}
+
+## Output
+When done, output ONLY a raw JSON object — no markdown fences, no prose:
+{{
+{field_lines},
+  "confidence": "high" | "medium" | "low",
+  "sources": ["url of each source actually used", ...]
+}}"""
+
+
+def _strip_fabricated_urls(data: Any, seen_text: str) -> Any:
+    """Null out any http(s) URL in the output that never appeared in a tool
+    result. Small models guess plausible URLs (e.g. linkedin.com/in/first-last)
+    — this ensures every returned URL was actually seen on the web."""
+    def clean(v: Any) -> Any:
+        if isinstance(v, str) and v.startswith(("http://", "https://")):
+            # match on the path portion so http/https + trailing-slash differences don't matter
+            core = v.split("://", 1)[-1].rstrip("/")
+            return v if core and core in seen_text else None
+        if isinstance(v, list):
+            cleaned = [clean(x) for x in v]
+            # drop URLs that got nulled (keeps e.g. a "sources" list tidy)
+            return [x for x in cleaned if x is not None] if any(
+                isinstance(x, str) and x.startswith("http") for x in v) else cleaned
+        if isinstance(v, dict):
+            return {k: clean(x) for k, x in v.items()}
+        return v
+    return clean(data)
+
+
+# ── Agent loop ────────────────────────────────────────────────────────────
+
+async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchResponse:
+    client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key or "none")
+    messages: list[Any] = [
+        {"role": "system", "content": build_system_prompt(req.task, req.context, req.output_fields)},
+        {"role": "user", "content": "Begin research now."},
+    ]
+
+    max_iterations = req.max_iterations or settings.max_iterations
+    force_conclude_at = max(max_iterations - 3, 1)
+    use_tools = True  # flips to tag mode if the server lacks a tool-call parser
+    total_tool_calls = 0
+    seen_text = ""  # everything the tools returned — used to catch fabricated URLs
+
+    for iteration in range(max_iterations):
+        if iteration == force_conclude_at:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have used many tool calls. Based on everything gathered so far, "
+                    "output your FINAL JSON object now. Unverified fields are null. "
+                    "No explanation — only the raw JSON object."
+                ),
+            })
+        kwargs: dict[str, Any] = dict(
+            model=settings.llm_model,
+            messages=messages,
+            timeout=settings.llm_timeout,
+        )
+        if use_tools:
+            kwargs["tools"] = TOOLS_SCHEMA
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            async with llm_semaphore:
+                response = await client.chat.completions.create(**kwargs)
+        except (InternalServerError, BadRequestError) as exc:
+            msg_text = str(exc).lower()
+            if "maximum context length" in msg_text:
+                log.warning("context overflow after %d iters; bailing", iteration + 1)
+                return ResearchResponse(status="parse_error", iterations=iteration + 1,
+                                        tool_calls=total_tool_calls)
+            if use_tools:
+                log.warning("server rejected tools (%s) — switching to tag mode",
+                            type(exc).__name__)
+                use_tools = False
+                kwargs.pop("tools", None)
+                kwargs.pop("tool_choice", None)
+                async with llm_semaphore:
+                    response = await client.chat.completions.create(**kwargs)
+            else:
+                raise
+
+        msg = response.choices[0].message
+        tool_calls = _normalise_tool_calls(msg)
+        if not tool_calls and msg.content:
+            tool_calls = _parse_tag_tool_calls(msg.content)
+
+        if not tool_calls:
+            data = _extract_json(msg.content or "")
+            if data is None:
+                log.warning("parse_error; final content (first 600): %r",
+                            (msg.content or "")[:600])
+            else:
+                data = _strip_fabricated_urls(data, seen_text)
+            return ResearchResponse(
+                status="success" if data is not None else "parse_error",
+                data=data, iterations=iteration + 1, tool_calls=total_tool_calls,
+            )
+
+        total_tool_calls += len(tool_calls)
+        log.info("iteration %d: %d tool call(s)", iteration + 1, len(tool_calls))
+        results = await asyncio.gather(*[_dispatch(tc, http) for tc in tool_calls])
+        seen_text += "\n".join(results)
+
+        if use_tools:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [{"id": tc["id"], "type": "function", "function": tc["function"]}
+                               for tc in tool_calls],
+            })
+            for tc, result in zip(tool_calls, results):
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        else:
+            messages.append({"role": "assistant", "content": msg.content})
+            messages.append({"role": "user", "content": "\n\n".join(
+                f"Result of {tc['function']['name']}:\n{r}"
+                for tc, r in zip(tool_calls, results)
+            )})
+
+    log.warning("max iterations reached")
+    return ResearchResponse(status="parse_error", iterations=max_iterations,
+                            tool_calls=total_tool_calls)
+
+
+# ── FastAPI app ───────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=settings.tool_timeout)
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(title="LightGent", lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "model": settings.llm_model, "base_url": settings.llm_base_url}
+
+
+@app.post("/research", response_model=ResearchResponse)
+async def research(req: ResearchRequest):
+    if not settings.llm_base_url or not settings.llm_model:
+        return ResearchResponse(status="error",
+                                data={"error": "Set LLM_BASE_URL and LLM_MODEL in .env"})
+    try:
+        return await run_agent(req, app.state.http)
+    except Exception as e:
+        log.exception("agent crashed")
+        return ResearchResponse(status="error", data={"error": str(e)})

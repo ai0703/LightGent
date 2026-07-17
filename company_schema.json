@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "what_they_sell": {"type": "string", "description": "one-sentence description of the main product/service"},
+    "business_model": {"type": "string", "enum": ["B2B", "B2C", "both"]},
+    "hq_country": {"type": "string", "description": "country of headquarters"}
+  },
+  "required": ["what_they_sell", "business_model"]
+}
