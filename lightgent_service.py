@@ -55,6 +55,12 @@ class Settings(BaseSettings):
     # Falls back to searxng_url.
     searxng_urls: str = ""
     searxng_token: str = ""
+    # Search fallback tiers (used only when SearXNG errors/saturates):
+    # tier 2 = OmniRoute's hosted search (/v1/search, duckduckgo-free — free);
+    # tier 3 = Apify search-scraper actor (only if apify_token is set).
+    omniroute_search_url: str = "http://localhost:20128/v1/search"
+    apify_token: str = ""
+    apify_search_actor: str = "apify~google-search-scraper"
 
     # Optional comma-separated SOCKS5 proxies for Jina fetches (empty = direct)
     jina_proxies: str = ""
@@ -137,26 +143,81 @@ TOOLS_SCHEMA = [
 ]
 
 
-async def web_search(query: str, http: httpx.AsyncClient) -> str:
-    pool = settings.searxng_endpoints()
-    base = random.choice(pool) if pool else ""
-    url = f"{base}/search"
-    headers = {}
-    if settings.searxng_token:
-        headers["Authorization"] = f"Bearer {settings.searxng_token}"
-    resp = await http.get(url, params={"q": query, "format": "json"}, headers=headers)
-    if resp.status_code >= 400:
-        log.warning("searxng %d query=%r", resp.status_code, query[:80])
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
+def _fmt_results(rows: list[dict]) -> str:
+    """Normalise any provider's rows to the agent-facing shape."""
     return json.dumps([
-        {
-            "url": r.get("url"),
-            "title": (r.get("title") or "")[:120],
-            "snippet": (r.get("content") or "")[:240],
-        }
-        for r in results[:6]
+        {"url": r.get("url"),
+         "title": (r.get("title") or "")[:120],
+         "snippet": (r.get("content") or r.get("snippet") or r.get("description") or "")[:240]}
+        for r in rows[:6]
     ])
+
+
+async def _search_searxng(query: str, http: httpx.AsyncClient) -> list[dict]:
+    """Tier 1: self-hosted SearXNG pool. Raises on error/saturation."""
+    pool = settings.searxng_endpoints()
+    if not pool:
+        return []
+    base = random.choice(pool)
+    headers = {"Authorization": f"Bearer {settings.searxng_token}"} if settings.searxng_token else {}
+    resp = await http.get(f"{base}/search", params={"q": query, "format": "json"}, headers=headers)
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+async def _search_omniroute(query: str, http: httpx.AsyncClient) -> list[dict]:
+    """Tier 2: OmniRoute hosted search (duckduckgo-free) — the SearXNG backup."""
+    resp = await http.post(settings.omniroute_search_url, json={"query": query},
+                           timeout=settings.tool_timeout)
+    resp.raise_for_status()
+    return resp.json().get("results", [])
+
+
+async def _search_apify(query: str, http: httpx.AsyncClient) -> list[dict]:
+    """Tier 3: Apify search-scraper (only when apify_token is set)."""
+    if not settings.apify_token:
+        return []
+    url = (f"https://api.apify.com/v2/acts/{settings.apify_search_actor}"
+           f"/run-sync-get-dataset-items?token={settings.apify_token}")
+    resp = await http.post(url, json={"queries": query, "resultsPerPage": 6,
+                                      "maxPagesPerQuery": 1}, timeout=90)
+    resp.raise_for_status()
+    items = resp.json()
+    rows: list[dict] = []
+    for it in items if isinstance(items, list) else []:
+        rows.extend(it.get("organicResults", []) or [])
+    return rows
+
+
+async def web_search(query: str, http: httpx.AsyncClient) -> str:
+    """SearXNG first; on error/saturation/empty fall to OmniRoute DuckDuckGo,
+    then to Apify (if configured). Each tier is tried only when the one above
+    it fails — the paid/heavier tiers stay idle until they're needed."""
+    # Tier 1 — SearXNG
+    try:
+        rows = await _search_searxng(query, http)
+        if rows:
+            return _fmt_results(rows)
+        log.warning("searxng empty q=%r -> fallback", query[:70])
+    except Exception as e:
+        log.warning("searxng failed (%s) q=%r -> fallback", type(e).__name__, query[:70])
+    # Tier 2 — OmniRoute DuckDuckGo
+    try:
+        rows = await _search_omniroute(query, http)
+        if rows:
+            log.info("search via OmniRoute-ddg (searxng backup) q=%r", query[:60])
+            return _fmt_results(rows)
+    except Exception as e:
+        log.warning("omniroute search failed (%s) q=%r", type(e).__name__, query[:70])
+    # Tier 3 — Apify
+    try:
+        rows = await _search_apify(query, http)
+        if rows:
+            log.info("search via Apify (tier 3) q=%r", query[:60])
+            return _fmt_results(rows)
+    except Exception as e:
+        log.warning("apify search failed (%s) q=%r", type(e).__name__, query[:70])
+    return json.dumps([])
 
 
 async def web_fetch(url: str) -> str:
