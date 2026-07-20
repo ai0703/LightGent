@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 test_leads*.csv
 endpoints.json
+*.log
+modal_*.py

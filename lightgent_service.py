@@ -24,7 +24,8 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI
-from openai import AsyncOpenAI, BadRequestError, InternalServerError
+from openai import (AsyncOpenAI, APIConnectionError, BadRequestError,
+                    InternalServerError, RateLimitError)
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,6 +57,9 @@ class Settings(BaseSettings):
 
     # Optional comma-separated SOCKS5 proxies for Jina fetches (empty = direct)
     jina_proxies: str = ""
+    # Paid Jina Reader key. Used ONLY as a fallback when the free proxy path
+    # fails or is rate-limited — keeps paid spend to the overflow only.
+    jina_api_key: str = ""
 
     max_iterations: int = 12
     llm_timeout: int = 180
@@ -64,6 +68,10 @@ class Settings(BaseSettings):
     max_concurrent: int = 3
 
     fetch_truncate: int = 2500
+    # Endurance: when the LLM backend is down/rate-limited mid-company, hold the
+    # in-progress conversation and retry the SAME step rather than discarding it.
+    # Give up on a company only after this many cumulative seconds of waiting.
+    max_cap_wait: int = 1200
 
     def endpoints(self) -> list[str]:
         """All LLM endpoints to spread work across (pool, else the single URL)."""
@@ -151,24 +159,44 @@ async def web_search(query: str, http: httpx.AsyncClient) -> str:
 
 
 async def web_fetch(url: str) -> str:
-    """Fetch a page as readable text via Jina reader, optional proxies first."""
+    """Fetch a page as readable text via Jina reader.
+
+    Order (cheapest first): free SOCKS5 proxy path → paid Jina key (fallback only,
+    used when the free path fails/rate-limits) → unauthenticated direct.
+    Headers ask Jina to drop images and return plain text, which cuts the tokens
+    Jina bills per fetch (page content varies ~800-8000 tokens)."""
     if "r.jina.ai/" in url:
         url = url.split("r.jina.ai/", 1)[-1]
     jina_url = f"https://r.jina.ai/{url}"
-    headers = {"Accept": "text/plain"}
+    # X-Retain-Images:none + text format => fewer billed tokens, no accuracy loss
+    headers = {"Accept": "text/plain", "X-Return-Format": "text", "X-Retain-Images": "none"}
 
+    # 1) FREE: proxy path (no key). Any non-200 falls through to the paid fallback.
     proxies = [p.strip() for p in settings.jina_proxies.split(",") if p.strip()]
     for proxy in proxies:
         try:
             async with httpx.AsyncClient(proxy=proxy, timeout=settings.tool_timeout) as client:
                 resp = await client.get(jina_url, headers=headers)
-                if resp.status_code >= 400:
-                    continue
-                return resp.text[: settings.fetch_truncate]
+                if resp.status_code == 200:
+                    return resp.text[: settings.fetch_truncate]
+                log.warning("jina free-proxy status %s url=%s", resp.status_code, url[:80])
         except Exception as e:
             log.warning("jina via proxy failed: %s url=%s", e, url[:80])
             continue
 
+    # 2) PAID FALLBACK: direct with the API key (only reached when free path fails)
+    if settings.jina_api_key:
+        try:
+            paid_headers = {**headers, "Authorization": f"Bearer {settings.jina_api_key}"}
+            async with httpx.AsyncClient(timeout=settings.tool_timeout) as client:
+                resp = await client.get(jina_url, headers=paid_headers)
+                if resp.status_code == 200:
+                    return resp.text[: settings.fetch_truncate]
+                log.warning("jina paid status %s url=%s", resp.status_code, url[:80])
+        except Exception as e:
+            log.warning("jina paid fetch failed: %s url=%s", e, url[:80])
+
+    # 3) LAST RESORT: unauthenticated direct
     async with httpx.AsyncClient(timeout=settings.tool_timeout) as client:
         resp = await client.get(jina_url, headers=headers)
         resp.raise_for_status()
@@ -394,24 +422,50 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
             kwargs["tools"] = TOOLS_SCHEMA
             kwargs["tool_choice"] = "auto"
 
-        try:
-            async with llm_semaphore:
-                response = await client.chat.completions.create(**kwargs)
-        except (InternalServerError, BadRequestError) as exc:
-            msg_text = str(exc).lower()
-            if "maximum context length" in msg_text:
-                log.warning("context overflow after %d iters; bailing", iteration + 1)
-                return ResearchResponse(status="parse_error", iterations=iteration + 1,
-                                        tool_calls=total_tool_calls)
-            if use_tools:
-                log.warning("server rejected tools (%s) — switching to tag mode",
-                            type(exc).__name__)
-                use_tools = False
-                kwargs.pop("tools", None)
-                kwargs.pop("tool_choice", None)
+        # Backend-aware LLM call. If the broker/provider is down or rate-limited,
+        # HOLD the (fully populated) `messages` and retry the SAME step — the
+        # gathered searches/fetches are never discarded by a mid-run cooldown.
+        response = None
+        cap_waited = 0.0
+        while response is None:
+            try:
                 async with llm_semaphore:
                     response = await client.chat.completions.create(**kwargs)
-            else:
+            except (InternalServerError, BadRequestError, RateLimitError,
+                    APIConnectionError) as exc:
+                msg_text = str(exc).lower()
+                status = getattr(exc, "status_code", None)
+                if "maximum context length" in msg_text:
+                    log.warning("context overflow after %d iters; bailing", iteration + 1)
+                    return ResearchResponse(status="parse_error", iterations=iteration + 1,
+                                            tool_calls=total_tool_calls)
+                backend_down = (
+                    status in (429, 502, 503, 504)
+                    or isinstance(exc, (RateLimitError, APIConnectionError))
+                    or "exhausted" in msg_text or "rate limit" in msg_text
+                    or "unavailable" in msg_text or "overloaded" in msg_text
+                )
+                if backend_down:
+                    if cap_waited >= settings.max_cap_wait:
+                        log.warning("backend down > max_cap_wait (%ds); giving up company",
+                                    settings.max_cap_wait)
+                        return ResearchResponse(status="parse_error", iterations=iteration + 1,
+                                                tool_calls=total_tool_calls)
+                    wait = min(120.0, 15.0 + cap_waited / 4)
+                    log.warning("backend down (%s) — holding %ds, retrying same step "
+                                "(iter %d, %d msgs preserved)",
+                                status or type(exc).__name__, int(wait), iteration + 1,
+                                len(messages))
+                    await asyncio.sleep(wait)
+                    cap_waited += wait
+                    continue
+                if use_tools:
+                    log.warning("server rejected tools (%s) — switching to tag mode",
+                                type(exc).__name__)
+                    use_tools = False
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    continue
                 raise
 
         msg = response.choices[0].message
