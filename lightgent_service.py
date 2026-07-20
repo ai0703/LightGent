@@ -20,6 +20,7 @@ import logging
 import random
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -343,6 +344,41 @@ is only allowed after a genuine search came up empty.
 - You have a hard tool-call budget — do not loop or repeat searches."""
 
 
+# ── Location playbooks ────────────────────────────────────────────────────
+# Per-country research packs (registries, local search terms, niche directories)
+# live as separate files in playbooks/. Only the pack matching the subject's
+# country is injected into the prompt — rows from other countries pay zero
+# tokens for it. Files are plain markdown so they can be edited without code.
+PLAYBOOKS_DIR = Path(__file__).resolve().parent / "playbooks"
+_COUNTRY_TO_PACK = {
+    "netherlands": "nl", "nederland": "nl", "holland": "nl", "nl": "nl",
+    "ireland": "ie", "ie": "ie",
+    "united kingdom": "uk", "uk": "uk", "gb": "uk", "great britain": "uk",
+    "england": "uk", "scotland": "uk", "wales": "uk",
+    "germany": "dach", "deutschland": "dach", "de": "dach",
+    "austria": "dach", "at": "dach", "switzerland": "dach", "ch": "dach",
+    "sweden": "nordics", "se": "nordics", "finland": "nordics", "fi": "nordics",
+    "united states": "us", "usa": "us", "us": "us", "america": "us",
+}
+_pack_cache: dict[str, str] = {}
+
+
+def _load_playbook(context: dict[str, Any]) -> str:
+    """Return the playbook section for the subject's country, or '' if none."""
+    country = str(context.get("country", "")).strip().lower()
+    pack = _COUNTRY_TO_PACK.get(country)
+    if not pack:
+        return ""
+    if pack not in _pack_cache:
+        path = PLAYBOOKS_DIR / f"{pack}.md"
+        try:
+            _pack_cache[pack] = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            _pack_cache[pack] = ""
+    text = _pack_cache[pack]
+    return f"\n\n## Local research playbook (use these sources/terms first)\n{text}" if text else ""
+
+
 def build_system_prompt(task: str, context: dict[str, Any],
                         output_fields: dict[str, str]) -> str:
     ctx_lines = "\n".join(f"- {k}: {v}" for k, v in context.items() if v) or "- (none provided)"
@@ -351,7 +387,7 @@ def build_system_prompt(task: str, context: dict[str, Any],
                                  for k, v in output_fields.items())
     else:
         field_lines = '  "answer": <the answer to the task, or null if not verifiable>'
-    return f"""{RESEARCH_METHOD}
+    return f"""{RESEARCH_METHOD}{_load_playbook(context)}
 
 ## Task
 {task}
