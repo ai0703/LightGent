@@ -29,8 +29,21 @@ from pathlib import Path
 
 import modal
 
-MODEL = "openai/gpt-oss-120b"
-GPU = "H100"
+# Teacher history, so nobody repeats it:
+#   gpt-oss-120b on 1x H100  -> weights fit but leave no KV cache room.
+#   gpt-oss-120b on 2x H100  -> boots and generates, but NEVER emits tool
+#     calls: it needs the harmony tool parser, which this vLLM build does not
+#     ship (valid parsers: hermes, mistral, llama3_json, qwen3_coder, ...).
+#     No tool calls means no usable trajectories.
+#   GLM-4.5-Air (chosen)     -> 106B MoE with 12B active, strong agentic
+#     tool use, FP8 fits 2x H100 with room for the KV cache. Uses the glm45
+#     tool parser, which this vLLM build ships. Roughly 7.90 USD per hour for
+#     the pair, billed per second. Teacher quality matters because the
+#     student learns the STEPS, not just the final answer.
+MODEL = "zai-org/GLM-4.5-Air-FP8"
+GPU = "H100:2"
+TENSOR_PARALLEL = 2
+TOOL_PARSER = "glm45"
 PORT = 8000
 MAX_MODEL_LEN = 16384
 
@@ -96,8 +109,9 @@ def serve():
         "--port", str(PORT),
         "--api-key", key,
         "--served-model-name", MODEL,
+        "--tensor-parallel-size", str(TENSOR_PARALLEL),
         "--enable-auto-tool-choice",
-        "--tool-call-parser", "openai",
+        "--tool-call-parser", TOOL_PARSER,
         "--max-model-len", str(MAX_MODEL_LEN),
         "--gpu-memory-utilization", "0.92",
     ]

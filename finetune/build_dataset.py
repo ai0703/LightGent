@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 URL_RE = re.compile(r"""https?://[^\s<>{}'"]+""", re.IGNORECASE)
 URL_TRAILING = "),.;:]'\""
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z' -]{1,79}$")
+# Never rewritten when stripping unverified URLs: these carry the answer itself.
+PROTECTED_FIELDS = ("owner_name", "title")
 SPLIT_RULE = "SHA-256 of normalized domain modulo the hash space; values below val_frac go to val"
 
 
@@ -69,16 +71,76 @@ def canonical_urls(value: str) -> set[str]:
     return result
 
 
-def has_supported_urls(row: dict[str, Any]) -> bool:
-    claimed = canonical_urls(str(row.get("final_content") or ""))
-    for value in strings(row.get("data")):
-        claimed.update(canonical_urls(value))
+def tool_evidence(row: dict[str, Any]) -> set[str]:
     evidence: set[str] = set()
     for message in row.get("messages", []):
         if isinstance(message, dict) and message.get("role") == "tool":
             for value in strings(message.get("content")):
                 evidence.update(canonical_urls(value))
-    return claimed <= evidence
+    return evidence
+
+
+def claimed_urls(row: dict[str, Any]) -> set[str]:
+    claimed = canonical_urls(str(row.get("final_content") or ""))
+    for value in strings(row.get("data")):
+        claimed.update(canonical_urls(value))
+    return claimed
+
+
+def has_supported_urls(row: dict[str, Any]) -> bool:
+    return claimed_urls(row) <= tool_evidence(row)
+
+
+def primary_url(row: dict[str, Any]) -> str | None:
+    """The person link the answer stands on. Fabricating it disqualifies the row."""
+    data = row.get("data")
+    if isinstance(data, dict):
+        value = data.get("linkedin_url")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in [*strings(data), str(row.get("final_content") or "")]:
+        for raw in URL_RE.findall(value):
+            if "linkedin.com" in raw.lower():
+                return raw.rstrip(URL_TRAILING)
+    return None
+
+
+def unverified_raw_urls(text: str, evidence: set[str]) -> list[str]:
+    found = []
+    for raw in URL_RE.findall(text):
+        trimmed = raw.rstrip(URL_TRAILING)
+        if canonical_urls(trimmed) - evidence:
+            found.append(trimmed)
+    return found
+
+
+def strip_unverified(value: Any, evidence: set[str], keep: str | None) -> Any:
+    """Remove URLs with no tool-result backing, keeping the primary URL as-is."""
+    if isinstance(value, str):
+        unverified = [u for u in unverified_raw_urls(value, evidence) if u != keep]
+        if not unverified:
+            return value
+        if canonical_urls(value) and value.strip() in unverified:
+            return None
+        cleaned = value
+        for url in unverified:
+            cleaned = cleaned.replace(url, "")
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\(\s*\)|\[\s*\]", "", cleaned)
+        return cleaned.strip(" ,;") or None
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            cleaned = strip_unverified(item, evidence, keep)
+            if cleaned not in (None, ""):
+                result.append(cleaned)
+        return result
+    if isinstance(value, dict):
+        return {
+            key: (item if key in PROTECTED_FIELDS else strip_unverified(item, evidence, keep))
+            for key, item in value.items()
+        }
+    return value
 
 
 def answered_name(data: Any) -> str | None:
@@ -130,9 +192,9 @@ def lane_allowed(row: dict[str, Any], prefixes: tuple[str, ...] | None) -> bool:
     )
 
 
-def output_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
+def output_messages(row: dict[str, Any], final_override: Any = None) -> list[dict[str, Any]]:
     messages = copy.deepcopy(row.get("messages", []))
-    final_content = row.get("final_content")
+    final_content = row.get("final_content") if final_override is None else final_override
     for message in reversed(messages):
         if message.get("role") == "assistant" and not message.get("tool_calls"):
             message["content"] = final_content
@@ -189,6 +251,7 @@ def build(
     min_val_rows: int = 60,
     min_train_domains: int = 400,
     max_rows_per_domain: int = 3,
+    strip_mode: bool = True,
 ) -> dict[str, Any]:
     if not 0.0 <= val_frac <= 1.0:
         raise ValueError("--val-frac must be between 0 and 1")
@@ -200,9 +263,16 @@ def build(
     paths = expand_inputs(inputs)
     gold = load_gold(gold_path)
     holdouts = load_holdouts(holdout_paths or [])
-    drops = {"status": 0, "anti_fabrication": 0, "lanes": 0, "gold": 0}
+    drops = {
+        "status": 0,
+        "anti_fabrication": 0,
+        "primary_url_unverified": 0,
+        "lanes": 0,
+        "gold": 0,
+    }
     kept: list[tuple[str, Any, int, dict[str, Any]]] = []
     rows_in = 0
+    rows_url_stripped = 0
 
     for path in paths:
         with path.open(encoding="utf-8") as handle:
@@ -217,9 +287,25 @@ def build(
                 if row.get("status") != "success":
                     drops["status"] += 1
                     continue
+                final_override = None
                 if not has_supported_urls(row):
-                    drops["anti_fabrication"] += 1
-                    continue
+                    if not strip_mode:
+                        drops["anti_fabrication"] += 1
+                        continue
+                    evidence = tool_evidence(row)
+                    primary = primary_url(row)
+                    # A fabricated person link is disqualifying; auxiliary
+                    # citations are stripped so the model learns to cite only
+                    # what it actually saw (mirrors _strip_fabricated_urls).
+                    if primary is not None and canonical_urls(primary) - evidence:
+                        drops["primary_url_unverified"] += 1
+                        continue
+                    final_override = strip_unverified(
+                        row.get("final_content"), evidence, primary
+                    )
+                    if final_override is None:
+                        final_override = ""
+                    rows_url_stripped += 1
                 if not lane_allowed(row, prefixes):
                     drops["lanes"] += 1
                     continue
@@ -229,7 +315,14 @@ def build(
                     if name is None or not any(last in name.lower() for last in gold[domain]):
                         drops["gold"] += 1
                         continue
-                kept.append((domain, row.get("ts"), rows_in, {"messages": output_messages(row)}))
+                kept.append(
+                    (
+                        domain,
+                        row.get("ts"),
+                        rows_in,
+                        {"messages": output_messages(row, final_override)},
+                    )
+                )
 
     holdout_exclusions = sum(domain in holdouts for domain, _, _, _ in kept)
     kept = [item for item in kept if item[0] not in holdouts]
@@ -284,6 +377,8 @@ def build(
         "drops": drops,
         "holdout_exclusions": holdout_exclusions,
         "per_domain_dedup_drops": dedup_drops,
+        "rows_url_stripped": rows_url_stripped,
+        "strip_unverified": strip_mode,
         "rows_out": {split: len(splits[split]) for split in splits},
         "unique_domains": {split: len(domains[split]) for split in domains},
         "val_frac": val_frac,
@@ -303,6 +398,7 @@ def build(
 
     return {
         "rows_in": rows_in, "drops": drops, "holdout_exclusions": holdout_exclusions,
+        "rows_url_stripped": rows_url_stripped,
         "per_domain_dedup_drops": dedup_drops, "train": len(splits["train"]),
         "val": len(splits["val"]), "percentiles": {
             p: percentile(lengths, p) for p in (50, 90, 99)
@@ -322,6 +418,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-val-rows", type=int, default=60)
     parser.add_argument("--min-train-domains", type=int, default=400)
     parser.add_argument("--max-rows-per-domain", type=int, default=3)
+    parser.add_argument(
+        "--no-strip-unverified",
+        dest="strip_unverified",
+        action="store_false",
+        help="drop rows with any unverified URL instead of stripping auxiliary ones",
+    )
+    parser.set_defaults(strip_unverified=True)
     return parser.parse_args()
 
 
@@ -331,13 +434,14 @@ def main() -> None:
         stats = build(
             args.inputs, args.out_dir, args.lanes, args.val_frac, args.gold, args.holdout,
             args.min_train_rows, args.min_val_rows, args.min_train_domains,
-            args.max_rows_per_domain,
+            args.max_rows_per_domain, args.strip_unverified,
         )
     except DatasetMinimumError as exc:
         raise SystemExit(str(exc)) from exc
     print(f"rows in: {stats['rows_in']}")
     for name, count in stats["drops"].items():
         print(f"dropped {name}: {count}")
+    print(f"rows with unverified urls stripped: {stats['rows_url_stripped']}")
     print(f"excluded holdout: {stats['holdout_exclusions']}")
     print(f"dropped per-domain cap: {stats['per_domain_dedup_drops']}")
     print(f"rows out train: {stats['train']}")

@@ -109,9 +109,10 @@ def _render_and_count(tokenizer, messages: list[dict[str, Any]]) -> tuple[str, i
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False
     )
-    token_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False
-    )
+    # Count from the rendered text. transformers 5.x returns a BatchEncoding
+    # from apply_chat_template(tokenize=True), so len() there gives the number
+    # of dict keys (2), not the number of tokens.
+    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
     if token_ids and isinstance(token_ids[0], list):

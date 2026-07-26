@@ -57,12 +57,13 @@ def test_all_filters_and_exact_messages(tmp_path):
     write_jsonl(source, rows)
     write_jsonl(gold, [{"domain": "gold.test", "gold": ["smith"]}])
 
-    stats = build([str(source)], out, val_frac=0, gold_path=gold)
+    stats = build([str(source)], out, val_frac=0, gold_path=gold, strip_mode=False)
 
     assert stats["rows_in"] == 5
     assert stats["drops"] == {
         "status": 1,
         "anti_fabrication": 1,
+        "primary_url_unverified": 0,
         "lanes": 1,
         "gold": 1,
     }
@@ -146,9 +147,39 @@ def test_url_canonical_adversarial_cases(tmp_path):
     rows[3]["messages"][3]["content"] = "no url"
     source = tmp_path / "rows.jsonl"
     write_jsonl(source, rows)
-    stats = build([str(source)], tmp_path / "out", val_frac=0)
+    stats = build([str(source)], tmp_path / "out", val_frac=0, strip_mode=False)
     assert stats["train"] == 2
     assert stats["drops"]["anti_fabrication"] == 2
+
+
+def test_strip_mode_keeps_rows_but_removes_unverified_urls(tmp_path):
+    """Default strip mode: auxiliary URLs are removed, primary linkedin drops the row."""
+    aux = trajectory("aux.test", final="See https://ok.test/a and https://invented.test/x")
+    linkedin_ok = trajectory(
+        "person.test",
+        final="Owner profile https://linkedin.com/in/real",
+        data={"owner_name": "Ada Smith", "linkedin_url": "https://linkedin.com/in/real"},
+    )
+    linkedin_ok["messages"][3]["content"] = "https://linkedin.com/in/real"
+    linkedin_fake = trajectory(
+        "fakeperson.test",
+        final="Owner profile https://linkedin.com/in/invented",
+        data={"owner_name": "Bob Jones", "linkedin_url": "https://linkedin.com/in/invented"},
+    )
+    scheme = trajectory("scheme.test", final="Source http://ok.test/a")
+
+    source = tmp_path / "rows.jsonl"
+    write_jsonl(source, [aux, linkedin_ok, linkedin_fake, scheme])
+    stats = build([str(source)], tmp_path / "out", lane_spec="*", val_frac=0)
+
+    # aux kept (stripped), linkedin_ok kept, scheme kept (http==https), fake dropped
+    assert stats["train"] == 3
+    assert stats["drops"]["primary_url_unverified"] == 1
+    assert stats["rows_url_stripped"] == 1
+    text = (tmp_path / "out" / "train.jsonl").read_text(encoding="utf-8")
+    assert "invented.test" not in text
+    assert "ok.test/a" in text
+    assert "linkedin.com/in/real" in text
 
 
 def test_normalization_holdout_cap_and_manifest(tmp_path):
