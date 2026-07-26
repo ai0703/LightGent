@@ -236,13 +236,25 @@ TOOLS_SCHEMA = [
 
 
 def _fmt_results(rows: list[dict]) -> str:
-    """Normalise any provider's rows to the agent-facing shape."""
+    """Normalise any provider's rows to the agent-facing shape.
+
+    ensure_ascii=False is load-bearing, not cosmetic. json.dumps defaults to
+    ASCII escaping, so every non-ASCII character reached the model as a literal
+    backslash-u sequence: "Wikstrøm" arrived as "Wikstr\\u00f8m". The model then
+    had to read mangled text, and any grounding check comparing its answer back
+    against the evidence failed on the same characters.
+
+    Measured on the Brreg set, five CORRECT Nordic answers looked ungrounded
+    for exactly this reason (Wikstrøm, Strøm, Grønlie, Røvik, Måle). It also
+    degrades every accented language, not just Norwegian: Dutch ë, German
+    umlauts, French accents all hit it.
+    """
     return json.dumps([
         {"url": r.get("url"),
          "title": (r.get("title") or "")[:120],
          "snippet": (r.get("content") or r.get("snippet") or r.get("description") or "")[:240]}
         for r in rows[:6]
-    ])
+    ], ensure_ascii=False)
 
 
 async def _search_serper(query: str, http: httpx.AsyncClient) -> list[dict]:
@@ -657,9 +669,26 @@ When done, output ONLY a raw JSON object — no markdown fences, no prose:
 
 _TUSSENVOEGSELS = {"van", "der", "den", "de", "ter", "ten", "te", "du", "le", "la"}
 
+# NFKD DELETES characters it cannot decompose, so "Oyvind" and "Øyvind" folded
+# to different strings and a correct answer looked ungrounded. Transliterate
+# first, the way each language romanises itself.
+_TRANSLITERATE = {
+    "ø": "o", "Ø": "o", "æ": "ae", "Æ": "ae", "å": "a", "Å": "a",
+    "ð": "d", "Ð": "d", "þ": "th", "Þ": "th", "ß": "ss",
+    "ł": "l", "Ł": "l", "đ": "d", "Đ": "d", "ı": "i", "İ": "i",
+}
+
+
+_ESCAPED = re.compile(r"\\u([0-9a-fA-F]{4})")
+
 
 def _fold(text: str) -> str:
-    return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+    # Decode literal backslash-u sequences first. Tool output used to carry
+    # them verbatim (see _fmt_results), and any already-banked trajectory or
+    # double-encoding provider still does, so grounding must see through it.
+    out = _ESCAPED.sub(lambda m: chr(int(m.group(1), 16)), text or "")
+    out = "".join(_TRANSLITERATE.get(ch, ch) for ch in out)
+    return unicodedata.normalize("NFKD", out).encode("ascii", "ignore").decode().lower()
 
 
 def _grounded_in(value: str, seen_text: str) -> bool:
@@ -691,6 +720,52 @@ def _answer_is_grounded(data: Any, seen_text: str) -> bool:
         isinstance(v, str) and v.strip() and _grounded_in(v, seen_text)
         for v in data.values()
     )
+
+
+_PERSON_FIELDS = ("owner_name", "name", "full_name", "contact_name", "person_name")
+
+
+def _strip_ungrounded_person(data: Any, seen_text: str) -> Any:
+    """Null out a reported PERSON whose surname never appeared in evidence.
+
+    Measured on the Brreg statutory set: 2 of 120 answers named someone absent
+    from the gathered text entirely. adnav.com returned "Anders Nilsen" with
+    neither token anywhere in 11k characters, a generically plausible Norwegian
+    name invented from nothing. 5-pluss.no returned "Rune Gjelsteen Johansson"
+    where the first two tokens WERE present but the surname was not.
+
+    Fabrication was 0 of 107 on Dutch companies and 2 of 120 on Norwegian ones,
+    so the risk rises when the name space is unfamiliar. For a lead product a
+    fabricated contact is worse than no contact: it burns a send and can cost a
+    sender domain. This converts that failure into an honest null.
+
+    Only person fields are touched. Titles and free text legitimately paraphrase
+    what a page said, so holding them to a substring test would delete good data.
+    """
+    if not isinstance(data, dict):
+        return data
+    if not (seen_text or "").strip():
+        # No research happened, so there is nothing to check a claim against
+        # and a substring test against "" would null every field
+        # unconditionally. Answering with no evidence is a different failure,
+        # and min_tool_calls is the guard for it.
+        return data
+    out = dict(data)
+    for field in _PERSON_FIELDS:
+        value = out.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if _grounded_in(value, seen_text):
+            continue
+        log.warning("ungrounded person %r in %s - nulling", value[:60], field)
+        out[field] = None
+        # The dependent fields described that person, so they go too.
+        for dependent in ("title", "linkedin_url"):
+            if dependent in out:
+                out[dependent] = None
+        if "confidence" in out:
+            out["confidence"] = "low"
+    return out
 
 
 def _strip_fabricated_urls(data: Any, seen_text: str) -> Any:
@@ -902,6 +977,7 @@ async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
                             (msg.content or "")[:600])
             else:
                 data = _strip_fabricated_urls(data, seen_text)
+                data = _strip_ungrounded_person(data, seen_text)
             return ResearchResponse(
                 status="success" if data is not None else "parse_error",
                 data=data, iterations=iteration + 1, tool_calls=total_tool_calls,
@@ -959,6 +1035,7 @@ async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
             data = _extract_json(final_msg.content)
             if data is not None:
                 data = _strip_fabricated_urls(data, seen_text)
+                data = _strip_ungrounded_person(data, seen_text)
                 log.info("forced finalisation produced an answer")
                 return ResearchResponse(status="success", data=data,
                                         iterations=max_iterations,
