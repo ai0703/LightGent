@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import re
+import unicodedata
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -78,6 +79,13 @@ class Settings(BaseSettings):
     jina_api_key: str = ""
 
     max_iterations: int = 12
+    # Floor for the answer-or-search decision: below this many tool calls an
+    # answer is only accepted when the values it reports are actually present
+    # in the evidence gathered so far. Off by default because LightGent serves
+    # caller-defined tasks, some of which are legitimately answerable without
+    # research. Set MIN_TOOL_CALLS=2 for enrichment runs, where an eager null
+    # is the expensive failure.
+    min_tool_calls: int = 0
     llm_timeout: int = 180
     tool_timeout: int = 45
     # A single Colab GPU chokes fast — keep in-flight LLM calls low.
@@ -545,6 +553,44 @@ When done, output ONLY a raw JSON object — no markdown fences, no prose:
 }}"""
 
 
+_TUSSENVOEGSELS = {"van", "der", "den", "de", "ter", "ten", "te", "du", "le", "la"}
+
+
+def _fold(text: str) -> str:
+    return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode().lower()
+
+
+def _grounded_in(value: str, seen_text: str) -> bool:
+    """Is this reported value actually present in what the tools returned?
+
+    Deliberately task-agnostic: LightGent fills caller-defined output fields,
+    so this cannot key on owner_name. For person names the last significant
+    token (the surname, skipping Dutch tussenvoegsels) is the discriminating
+    part; for other values the whole string is checked.
+    """
+    haystack = _fold(seen_text)
+    if not haystack:
+        return False
+    folded = _fold(value)
+    if folded and folded in haystack:
+        return True
+    parts = [p for p in re.sub(r"[^a-z ]", " ", folded).split()
+             if p not in _TUSSENVOEGSELS and len(p) > 1]
+    return bool(parts) and parts[-1] in haystack
+
+
+def _answer_is_grounded(data: Any, seen_text: str) -> bool:
+    """True when the answer asserts at least one substantive value that the
+    evidence supports. An all-null answer is never 'grounded', which is
+    exactly the eager-abstention case the floor exists to catch."""
+    if not isinstance(data, dict):
+        return False
+    return any(
+        isinstance(v, str) and v.strip() and _grounded_in(v, seen_text)
+        for v in data.values()
+    )
+
+
 def _strip_fabricated_urls(data: Any, seen_text: str) -> Any:
     """Null out any http(s) URL in the output that never appeared in a tool
     result. Small models guess plausible URLs (e.g. linkedin.com/in/first-last)
@@ -730,9 +776,25 @@ async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
             tool_calls = _parse_tag_tool_calls(msg.content)
 
         if not tool_calls:
+            # FLOOR. Nothing used to stop the model answering on turn one with
+            # no evidence at all, so any eagerness (from training or from a
+            # confident base model) produced instant nulls that the loop
+            # accepted as successes. An answer is only admissible once real
+            # evidence exists, or if it is a grounded non-null answer.
+            data = _extract_json(msg.content or "")
+            if (total_tool_calls < settings.min_tool_calls
+                    and not _answer_is_grounded(data, seen_text)):
+                log.warning("premature answer after %d tool calls - pushing back",
+                            total_tool_calls)
+                messages.append({"role": "assistant", "content": msg.content})
+                messages.append({"role": "user", "content": (
+                    "You have not gathered enough evidence yet. Do NOT answer "
+                    "now. Call the research tools first, then answer."
+                )})
+                continue
+
             state["final_content"] = msg.content
             messages.append({"role": "assistant", "content": msg.content})
-            data = _extract_json(msg.content or "")
             if data is None:
                 log.warning("parse_error; final content (first 600): %r",
                             (msg.content or "")[:600])
@@ -779,8 +841,14 @@ async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
             "you actually saw, and use null for anything you genuinely could "
             "not find."
         )})
+        # CEILING. The old nudge asked the model to stop calling tools while
+        # still OFFERING them, and it answered with a plain-text <tool_call>
+        # block every time, which nothing parsed. Measured 2026-07-26 over
+        # n=20: 17 companies had the owner name in hand, 1 emitted the JSON.
+        # Withdrawing the tools is what makes the instruction enforceable.
         final_resp = await client.chat.completions.create(
             model=model, messages=messages, temperature=0.0,
+            tools=TOOLS_SCHEMA, tool_choice="none",
             timeout=settings.llm_timeout,
         )
         final_msg = final_resp.choices[0].message
