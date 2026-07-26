@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # tier 2 = OmniRoute's hosted search (/v1/search, duckduckgo-free — free);
     # tier 3 = Apify search-scraper actor (only if apify_token is set).
     omniroute_search_url: str = "http://localhost:20128/v1/search"
+    # tier 0 = Serper (Google). Leads the chain when set: SearXNG upstreams
+    # get rate-limited and silently return irrelevant results.
+    serper_api_key: str = ""
+    serper_country: str = "nl"
+    serper_lang: str = "nl"
     apify_token: str = ""
     apify_search_actor: str = "apify~google-search-scraper"
 
@@ -158,6 +163,45 @@ def _fmt_results(rows: list[dict]) -> str:
     ])
 
 
+async def _search_serper(query: str, http: httpx.AsyncClient) -> list[dict]:
+    """Tier 0: Serper (Google). Real results, unlike a rate-limited SearXNG.
+
+    Measured 2026-07-26: with both SearXNG upstreams throttled (duckduckgo
+    timeout, google cse "too many requests"), a Dutch company-owner query
+    returned Jeffrey Epstein articles. The same query through Serper returned
+    the company LinkedIn page, its KVK record and its team page.
+    """
+    key = settings.serper_api_key
+    if not key:
+        return []
+    resp = await http.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": key, "Content-Type": "application/json"},
+        json={"q": query, "gl": settings.serper_country, "hl": settings.serper_lang,
+              "num": 8},
+        timeout=settings.tool_timeout,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    rows = []
+    for item in (payload.get("organic") or []):
+        rows.append({
+            "url": item.get("link"),
+            "title": item.get("title"),
+            "content": item.get("snippet"),
+        })
+    # Knowledge panel often names the founder or CEO outright.
+    kg = payload.get("knowledgeGraph") or {}
+    if kg.get("title"):
+        attrs = "; ".join(f"{k}: {v}" for k, v in (kg.get("attributes") or {}).items())
+        rows.insert(0, {
+            "url": kg.get("website") or kg.get("descriptionLink") or "",
+            "title": f"[knowledge graph] {kg.get('title')}",
+            "content": " ".join(x for x in (kg.get("description"), attrs) if x),
+        })
+    return rows
+
+
 async def _search_searxng(query: str, http: httpx.AsyncClient) -> list[dict]:
     """Tier 1: self-hosted SearXNG pool. Raises on error/saturation."""
     pool = settings.searxng_endpoints()
@@ -195,9 +239,19 @@ async def _search_apify(query: str, http: httpx.AsyncClient) -> list[dict]:
 
 
 async def web_search(query: str, http: httpx.AsyncClient) -> str:
-    """SearXNG first; on error/saturation/empty fall to OmniRoute DuckDuckGo,
-    then to Apify (if configured). Each tier is tried only when the one above
-    it fails — the paid/heavier tiers stay idle until they're needed."""
+    """Serper first when a key is set, then SearXNG, then OmniRoute
+    DuckDuckGo, then Apify. Each tier is tried only when the one above it
+    fails. Serper leads because result QUALITY, not speed, was the binding
+    constraint measured on 2026-07-26."""
+    # Tier 0 — Serper (Google)
+    if settings.serper_api_key:
+        try:
+            rows = await _search_serper(query, http)
+            if rows:
+                return _fmt_results(rows)
+            log.warning("serper empty q=%r -> fallback", query[:70])
+        except Exception as e:
+            log.warning("serper failed (%s) q=%r -> fallback", type(e).__name__, query[:70])
     # Tier 1 — SearXNG
     try:
         rows = await _search_searxng(query, http)
@@ -711,7 +765,39 @@ async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
                 for tc, r in zip(tool_calls, results)
             )})
 
-    log.warning("max iterations reached")
+    # FORCED FINALISATION. Running out of iterations used to return nothing,
+    # even when the evidence already named the person. Measured 2026-07-26:
+    # 9 of 9 companies had the correct name in the tool results and every one
+    # returned null, because the loop never asked the model to conclude. One
+    # extra turn with no tools offered turns those into real answers.
+    log.warning("max iterations reached - forcing a final answer")
+    try:
+        messages.append({"role": "user", "content": (
+            "You have run out of research steps. Do NOT call any more tools. "
+            "Using ONLY the evidence already gathered above, output the final "
+            "JSON object now. Fill every field you can support with evidence "
+            "you actually saw, and use null for anything you genuinely could "
+            "not find."
+        )})
+        final_resp = await client.chat.completions.create(
+            model=model, messages=messages, temperature=0.0,
+            timeout=settings.llm_timeout,
+        )
+        final_msg = final_resp.choices[0].message
+        state["final_content"] = final_msg.content
+        if final_msg.content:
+            data = _extract_json(final_msg.content)
+            if data is not None:
+                data = _strip_fabricated_urls(data, seen_text)
+                log.info("forced finalisation produced an answer")
+                return ResearchResponse(status="success", data=data,
+                                        iterations=max_iterations,
+                                        tool_calls=total_tool_calls)
+            log.warning("forced finalisation did not parse: %r",
+                        (final_msg.content or "")[:300])
+    except Exception as exc:  # noqa: BLE001 - never let this mask the timeout
+        log.warning("forced finalisation failed (%s)", type(exc).__name__)
+
     return ResearchResponse(status="parse_error", iterations=max_iterations,
                             tool_calls=total_tool_calls)
 
