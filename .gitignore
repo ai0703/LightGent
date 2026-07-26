@@ -5,3 +5,7 @@ test_leads*.csv
 endpoints.json
 *.log
 modal_*.py
+# fine-tune data holds real people's names; never commit to this public repo
+finetune/rescued-evals/
+finetune/data/
+finetune/checkpoints/
