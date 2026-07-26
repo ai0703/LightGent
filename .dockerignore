@@ -1,0 +1,14 @@
+# Secrets come from fly secrets, never the image.
+.env
+.env.*
+.git/
+__pycache__/
+logs/
+*.log
+*.ipynb
+*.csv
+data/
+modal_*.py
+modal_*.log
+start-stack.ps1
+stop-stack.ps1

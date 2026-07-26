@@ -283,8 +283,28 @@ async def _dispatch(tc: dict, http: httpx.AsyncClient) -> str:
 
 # ── Parsing helpers (same tricks as enrich-service) ───────────────────────
 
-def _parse_tag_tool_calls(content: str) -> list[dict]:
+def _content_to_text(content: Any) -> str:
+    """Coerce an LLM message's content to plain text. Some providers return
+    content as a LIST of {type,text} blocks instead of a string; regex helpers
+    crash on that (TypeError: expected string, got 'list'). Normalise here."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for p in content:
+            if isinstance(p, str):
+                out.append(p)
+            elif isinstance(p, dict):
+                out.append(p.get("text") or p.get("content") or "")
+        return "".join(out)
+    return str(content)
+
+
+def _parse_tag_tool_calls(content: Any) -> list[dict]:
     """Parse <tool_call>...</tool_call> tags emitted when vLLM tool parser is missing."""
+    content = _content_to_text(content)
     matches = re.findall(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL)
     result = []
     for i, m in enumerate(matches):
@@ -333,11 +353,12 @@ def _balanced_slice(text: str, open_ch: str, close_ch: str) -> str | None:
     return None
 
 
-def _extract_json(content: str) -> Any:
+def _extract_json(content: Any) -> Any:
     """Extract the last balanced JSON object or array from model output.
 
     Handles markdown fences, explanatory prose before/after, and nested
     structures. Returns None when nothing parseable is found."""
+    content = _content_to_text(content)
     if not content:
         return None
     cleaned = re.sub(r"```(?:json)?\s*", "", content)
@@ -612,8 +633,15 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from lane_queue import get_queue
     app.state.http = httpx.AsyncClient(timeout=settings.tool_timeout)
+    broker = settings.llm_base_url
+    if broker:
+        broker = broker.removesuffix("/v1").rstrip("/")
+    app.state.queue = get_queue(broker_url=broker, api_key=settings.llm_api_key)
+    await app.state.queue.start()
     yield
+    await app.state.queue.stop()
     await app.state.http.aclose()
 
 
@@ -622,11 +650,34 @@ app = FastAPI(title="LightGent", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "model": settings.llm_model, "base_url": settings.llm_base_url}
+    q = app.state.queue
+    return {
+        "ok": True,
+        "model": settings.llm_model,
+        "base_url": settings.llm_base_url,
+        "queue_depth": q.queue_depth,
+        "active_requests": q.active_count,
+        "lanes_available": q._lanes_available,
+    }
+
+
+@app.get("/queue/status")
+async def queue_status():
+    """Check queue and lane status without making a request."""
+    q = app.state.queue
+    active, parked = await q._check_lanes()
+    return {
+        "lanes_active": active,
+        "lanes_parked": parked,
+        "queue_depth": q.queue_depth,
+        "active_requests": q.active_count,
+        "lanes_available": q._lanes_available,
+    }
 
 
 @app.post("/research", response_model=ResearchResponse)
 async def research(req: ResearchRequest):
+    """Direct research (no queue). Fails if backend is down."""
     if not settings.llm_base_url or not settings.llm_model:
         return ResearchResponse(status="error",
                                 data={"error": "Set LLM_BASE_URL and LLM_MODEL in .env"})
@@ -635,3 +686,132 @@ async def research(req: ResearchRequest):
     except Exception as e:
         log.exception("agent crashed")
         return ResearchResponse(status="error", data={"error": str(e)})
+
+
+# ── enrichos adapter ───────────────────────────────────────────────────────
+# Drop-in replacement for the old enrichos enrich-service. The enrichos worker
+# POSTs {company, domain, city, limit, roles} and expects {employees:[...]}
+# where each item has the keys insert_employee() reads: name, title,
+# linkedin_url, source, confidence. This runs LightGent's research agent on the
+# free balance broker instead of the retired RunPod pod.
+
+class EnrichCompanyRequest(BaseModel):
+    company: str
+    domain: str = ""
+    city: str = ""
+    limit: int = 3
+    roles: list[str] = Field(default_factory=list)
+
+
+def _enrich_task(req: "EnrichCompanyRequest") -> str:
+    roles = ", ".join([r for r in req.roles if r]) or \
+        "Owner, CEO, Founder, Managing Director, Director"
+    where = f" (website {req.domain})" if req.domain else ""
+    loc = f", located in {req.city}" if req.city else ""
+    return (
+        f'Find up to {req.limit} senior decision-makers at the company "{req.company}"{where}{loc}. '
+        f"Only include people whose role is one of: {roles}. "
+        "For each person capture: full name, exact job title, LinkedIn profile URL if you find "
+        "one, the source URL where you found them, and a confidence of high/medium/low. "
+        "Do not invent people or titles. If you cannot find anyone in those roles, return an "
+        "empty list."
+    )
+
+
+def _coerce_employees(data: Any) -> list[dict]:
+    """Normalise run_agent output into the worker's expected employee dicts."""
+    if isinstance(data, dict):
+        emps = data.get("employees")
+    elif isinstance(data, list):
+        emps = data
+    else:
+        emps = None
+    if not isinstance(emps, list):
+        return []
+    out = []
+    for e in emps:
+        if not isinstance(e, dict):
+            continue
+        name = (e.get("name") or e.get("full_name") or "").strip()
+        if not name or name.lower() in ("unknown", "null", "none"):
+            continue
+        out.append({
+            "name": name,
+            "title": e.get("title") or e.get("role") or "",
+            "linkedin_url": e.get("linkedin_url") or e.get("linkedin") or None,
+            "source": e.get("source") or e.get("source_url") or "",
+            "confidence": e.get("confidence") or "low",
+        })
+    return out
+
+
+@app.post("/enrich-company")
+async def enrich_company(req: EnrichCompanyRequest):
+    if not settings.llm_base_url or not settings.llm_model:
+        return {"company": req.company, "domain": req.domain, "status": "error",
+                "employees": [], "error": "Set LLM_BASE_URL and LLM_MODEL"}
+    rr = ResearchRequest(
+        task=_enrich_task(req),
+        context={"company": req.company, "domain": req.domain, "city": req.city},
+        output_fields={
+            "employees": ("JSON array of the people found. Each item is an object with keys "
+                          "name, title, linkedin_url, source, confidence. Return [] if none.")
+        },
+    )
+    try:
+        res = await run_agent(rr, app.state.http)
+    except Exception as e:
+        log.exception("enrich-company crashed")
+        return {"company": req.company, "domain": req.domain, "status": "error",
+                "employees": [], "error": str(e)}
+    employees = _coerce_employees(res.data)
+    if employees:
+        status = "success"
+    else:
+        status = "parse_error" if res.status == "success" else res.status
+    return {"company": req.company, "domain": req.domain, "status": status,
+            "employees": employees, "iterations": res.iterations,
+            "tool_calls": res.tool_calls}
+
+
+@app.post("/research/queued", response_model=ResearchResponse)
+async def research_queued(req: ResearchRequest):
+    """Queue-aware research. Waits for a lane to become available (even days).
+
+    Use this endpoint when you want guaranteed completion -- no 503 errors.
+    The request sits in a queue and is dispatched as soon as a lane opens.
+    """
+    if not settings.llm_base_url or not settings.llm_model:
+        return ResearchResponse(status="error",
+                                data={"error": "Set LLM_BASE_URL and LLM_MODEL in .env"})
+    try:
+        from lane_queue import get_queue
+        queue = get_queue()
+        result = await queue.enqueue(req.model_dump())
+        return ResearchResponse(**result)
+    except Exception as e:
+        log.exception("queued research failed")
+        return ResearchResponse(status="error", data={"error": str(e)})
+
+
+@app.post("/research/batch")
+async def research_batch(requests: list[ResearchRequest]):
+    """Process multiple requests through the queue.
+
+    Returns results in the same order as the input requests.
+    All requests wait for lanes -- none fail due to exhaustion.
+    """
+    if not settings.llm_base_url or not settings.llm_model:
+        return [{"status": "error", "data": {"error": "Set LLM_BASE_URL and LLM_MODEL in .env"}}
+                for _ in requests]
+    from lane_queue import get_queue
+    queue = get_queue()
+    tasks = [queue.enqueue(req.model_dump()) for req in requests]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    out = []
+    for r in results:
+        if isinstance(r, Exception):
+            out.append({"status": "error", "data": {"error": str(r)}, "iterations": 0, "tool_calls": 0})
+        else:
+            out.append(r)
+    return out
