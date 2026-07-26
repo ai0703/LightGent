@@ -9,3 +9,6 @@ modal_*.py
 finetune/rescued-evals/
 finetune/data/
 finetune/checkpoints/
+
+# Datacenter proxy list (credentials, never commit)
+proxies.txt

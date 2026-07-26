@@ -34,6 +34,9 @@ from openai import (AsyncOpenAI, APIConnectionError, BadRequestError,
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from proxy_balancer import ProxyBalancer
+from searxng_balancer import SearxngBalancer
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("lightgent")
 
@@ -74,6 +77,15 @@ class Settings(BaseSettings):
 
     # Optional comma-separated SOCKS5 proxies for Jina fetches (empty = direct)
     jina_proxies: str = ""
+    # File of datacenter proxies, one `ip:port:user:pass` per line, gitignored.
+    # Measured 2026-07-26: 100 such IPs sustain 2,393 fetches/min through the
+    # balancer with 0 pct waste, versus 39/min from a single direct IP that 429s
+    # on 68 pct of calls. So when this file exists it is the PRIMARY fetch lane.
+    proxy_list_file: str = "proxies.txt"
+    # Per-attempt timeout for ONE proxy lane, not for the whole fetch. With 100
+    # lanes, abandoning a silent lane fast beats waiting on it: p95 through the
+    # pool is 1.3s, so 12s is already ~9x the slowest healthy response.
+    fetch_lane_timeout: int = 12
     # Paid Jina Reader key. Used ONLY as a fallback when the free proxy path
     # fails or is rate-limited — keeps paid spend to the overflow only.
     jina_api_key: str = ""
@@ -107,9 +119,71 @@ class Settings(BaseSettings):
         pool = [u.strip().rstrip("/") for u in self.searxng_urls.split(",") if u.strip()]
         return pool or ([self.searxng_url.rstrip("/")] if self.searxng_url else [])
 
+    def datacenter_proxies(self) -> list[str]:
+        """Proxy URLs from proxy_list_file, or [] when the file is absent."""
+        path = Path(self.proxy_list_file)
+        if not self.proxy_list_file or not path.exists():
+            return []
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            f = line.strip().split(":")
+            if len(f) >= 4:
+                out.append(f"http://{f[2]}:{f[3]}@{f[0]}:{f[1]}")
+            elif len(f) == 2:
+                out.append(f"http://{f[0]}:{f[1]}")
+        return out
+
 
 settings = Settings()
 llm_semaphore = asyncio.Semaphore(settings.max_concurrent)
+
+# Lazily started balancers, shared for the process lifetime. Both are async
+# context managers; we enter them once under a lock rather than per request,
+# because their whole value is the state they accumulate across calls (per-IP
+# pacing, per-shard engine health).
+_fetch_pool: "ProxyBalancer | None" = None
+_search_pool: "SearxngBalancer | None" = None
+_pool_lock = asyncio.Lock()
+
+
+async def _get_fetch_pool():
+    """ProxyBalancer over the datacenter list, or None when not configured."""
+    global _fetch_pool
+    if _fetch_pool is not None:
+        return _fetch_pool
+    async with _pool_lock:
+        if _fetch_pool is None:
+            proxies = settings.datacenter_proxies()
+            if not proxies:
+                return None
+            # Short per-attempt timeout on purpose. Measured p50 0.55s and p95
+            # 1.3s through this pool, so a lane that has not answered in 12s is
+            # dead, and waiting tool_timeout (45s) on it just to retry elsewhere
+            # turned one fetch into 85s in the first wired run. Failing fast and
+            # switching lanes is strictly better when there are 100 lanes.
+            pool = ProxyBalancer(proxies, per_lane_connections=4,
+                                 timeout=settings.fetch_lane_timeout)
+            await pool.__aenter__()
+            _fetch_pool = pool
+            log.info("fetch balancer started with %d proxy lanes", len(proxies))
+    return _fetch_pool
+
+
+async def _get_search_pool():
+    """SearxngBalancer over the shard pool, or None when fewer than 1 endpoint."""
+    global _search_pool
+    if _search_pool is not None:
+        return _search_pool
+    async with _pool_lock:
+        if _search_pool is None:
+            urls = settings.searxng_endpoints()
+            if not urls:
+                return None
+            pool = SearxngBalancer(urls, timeout=settings.tool_timeout)
+            await pool.__aenter__()
+            _search_pool = pool
+            log.info("search balancer started with %d shard(s)", len(urls))
+    return _search_pool
 trajectory_log_lock = asyncio.Lock()
 
 
@@ -211,15 +285,21 @@ async def _search_serper(query: str, http: httpx.AsyncClient) -> list[dict]:
 
 
 async def _search_searxng(query: str, http: httpx.AsyncClient) -> list[dict]:
-    """Tier 1: self-hosted SearXNG pool. Raises on error/saturation."""
-    pool = settings.searxng_endpoints()
-    if not pool:
+    """Tier 1: self-hosted SearXNG pool, routed by engine health.
+
+    The balancer reads `unresponsive_engines` from each answer and steers queries
+    away from a shard whose Google is suspended, while still using that shard for
+    Bing and DuckDuckGo. Measured 2026-07-26: one instance held 86 pct Google,
+    three shards round-robin 94 pct, because a suspension is per instance and
+    takes Google off EVERY query through it for the whole cooldown.
+    """
+    pool = await _get_search_pool()
+    if pool is None:
         return []
-    base = random.choice(pool)
-    headers = {"Authorization": f"Bearer {settings.searxng_token}"} if settings.searxng_token else {}
-    resp = await http.get(f"{base}/search", params={"q": query, "format": "json"}, headers=headers)
-    resp.raise_for_status()
-    return resp.json().get("results", [])
+    payload, _shard = await pool.search(query, prefer_engine="google")
+    if payload is None:
+        raise RuntimeError("all searxng shards failed")
+    return payload.get("results", [])
 
 
 async def _search_omniroute(query: str, http: httpx.AsyncClient) -> list[dict]:
@@ -300,7 +380,29 @@ async def web_fetch(url: str) -> str:
     # X-Retain-Images:none + text format => fewer billed tokens, no accuracy loss
     headers = {"Accept": "text/plain", "X-Return-Format": "text", "X-Retain-Images": "none"}
 
-    # 1) FREE: proxy path (no key). Any non-200 falls through to the paid fallback.
+    # 1) PRIMARY: the datacenter proxy pool, paced per IP by the balancer.
+    # Jina's limit is PER IP (measured: 125 of 184 calls 429ed from one IP,
+    # zero 429s across rotating IPs), so the pool is what makes fetch scale.
+    pool = await _get_fetch_pool()
+    if pool is not None:
+        status, text, _lane = await pool.get(jina_url, headers=headers)
+        if status == 200:
+            return text[: settings.fetch_truncate]
+        log.warning("jina via proxy pool status=%s url=%s", status, url[:80])
+        # 1b) Straight to unauthenticated direct. Measured 2026-07-26: the SOCKS5
+        # lane returns 451 and the paid key 402, so trying them after a pool miss
+        # is a guaranteed ~3s tax before the lane that actually works. Direct is
+        # 1.1-1.6s and rate limits only above ~39/min, which the pool absorbs.
+        try:
+            async with httpx.AsyncClient(timeout=settings.fetch_lane_timeout) as client:
+                resp = await client.get(jina_url, headers=headers)
+            if resp.status_code == 200:
+                return resp.text[: settings.fetch_truncate]
+            log.warning("jina direct status %s url=%s", resp.status_code, url[:80])
+        except Exception as e:
+            log.warning("jina direct failed: %s url=%s", e, url[:80])
+
+    # 2) SOCKS5 proxies, when configured. Kept for the residential lane.
     proxies = [p.strip() for p in settings.jina_proxies.split(",") if p.strip()]
     for proxy in proxies:
         try:

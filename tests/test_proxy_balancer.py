@@ -32,12 +32,20 @@ class FakeClient:
         pass
 
 
-def attach(balancer, scripts):
-    for lane, script in zip(balancer.lanes, scripts):
+def attach(balancer, scripts, ordered=False):
+    """Stub each lane's client.
+
+    ordered=True forces lane 0 to be selected first, which the failover tests
+    need. _acquire breaks ties with random.random(), and available_at() clamps to
+    now, so the only way to order lanes is to push the later ones slightly into
+    the future.
+    """
+    now = time.monotonic()
+    for i, (lane, script) in enumerate(zip(balancer.lanes, scripts)):
         lane.client = FakeClient(script)
         # Make every lane immediately due so tests do not wait on pacing.
         lane.next_allowed_at = 0.0
-        lane.cooldown_until = 0.0
+        lane.cooldown_until = (now + 0.02 * i) if ordered else 0.0
 
 
 def test_success_raises_rate_additively():
@@ -102,7 +110,7 @@ def test_limited_lane_is_retried_on_a_different_lane():
     async def go():
         bal = ProxyBalancer(["http://a", "http://b"], max_attempts=3)
         # Lane a always 429s; lane b always succeeds.
-        attach(bal, [[429], [200]])
+        attach(bal, [[429], [200]], ordered=True)
         status, _, lane = await bal.request("GET", "http://target")
         assert status == 200
         assert lane.url == "http://b"
@@ -150,7 +158,7 @@ def test_load_spreads_across_lanes_rather_than_hammering_one():
 def test_stats_reports_waste_and_parked_counts():
     async def go():
         bal = ProxyBalancer(["http://a", "http://b"], max_attempts=2)
-        attach(bal, [[429], [200]])
+        attach(bal, [[429], [200]], ordered=True)
         await bal.request("GET", "http://target")
         s = bal.stats()
         assert s["lanes"] == 2

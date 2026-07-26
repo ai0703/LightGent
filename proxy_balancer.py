@@ -33,7 +33,16 @@ INCREASE_PER_SUCCESS = 0.25   # additive increase
 DECREASE_FACTOR = 0.5         # multiplicative decrease on a limit signal
 COOLDOWN_BASE_SEC = 20.0
 COOLDOWN_MAX_SEC = 600.0
-LIMIT_STATUSES = frozenset({429, 401, 403, 451, 503})
+# Soft: the lane is fine, we just went too fast. Back off and come back.
+SOFT_LIMIT_STATUSES = frozenset({429, 503})
+# Hard: the destination has rejected THIS IP, not our rate. Measured 2026-07-26:
+# r.jina.ai returns 401 for about 20 pct of the datacenter pool while the same
+# IPs return 200 on a neutral target, so it is per-IP blocking, not throttling.
+# Retrying those on a 20s backoff just burns attempts, so bench them for a long
+# time instead.
+HARD_LIMIT_STATUSES = frozenset({401, 403, 451})
+HARD_COOLDOWN_SEC = 1800.0
+LIMIT_STATUSES = SOFT_LIMIT_STATUSES | HARD_LIMIT_STATUSES
 
 
 @dataclass
@@ -63,9 +72,14 @@ class Lane:
         self.rate_per_min = min(MAX_RATE_PER_MIN,
                                 self.rate_per_min + INCREASE_PER_SUCCESS)
 
-    def on_limited(self, now: float) -> None:
+    def on_limited(self, now: float, hard: bool = False) -> None:
         self.limited += 1
         self.consecutive_limits += 1
+        if hard:
+            # Destination rejected this IP outright. Rate is not the problem, so
+            # leave it alone and just take the lane out of rotation for a while.
+            self.cooldown_until = now + HARD_COOLDOWN_SEC
+            return
         self.rate_per_min = max(MIN_RATE_PER_MIN,
                                 self.rate_per_min * DECREASE_FACTOR)
         # Exponential backoff, so a genuinely dead lane stops being retried often.
@@ -108,9 +122,13 @@ class ProxyBalancer:
         limits = httpx.Limits(
             max_connections=self._per_lane_connections,
             max_keepalive_connections=self._per_lane_connections)
+        # ONE ssl context shared by every lane. Letting httpx build its own per
+        # client cost 81.5s to start a 100 lane pool, which dwarfed the 1.5s
+        # fetches it then served. Building it once takes milliseconds.
+        ctx = httpx.create_ssl_context()
         for lane in self.lanes:
             lane.client = httpx.AsyncClient(proxy=lane.url, timeout=self._timeout,
-                                            limits=limits)
+                                            limits=limits, verify=ctx)
         return self
 
     async def __aexit__(self, *exc):
@@ -154,7 +172,7 @@ class ProxyBalancer:
                 last = (type(exc).__name__, "", lane)
                 continue
             if resp.status_code in LIMIT_STATUSES:
-                lane.on_limited(now)
+                lane.on_limited(now, hard=resp.status_code in HARD_LIMIT_STATUSES)
                 last = (resp.status_code, "", lane)
                 continue
             lane.on_success()
