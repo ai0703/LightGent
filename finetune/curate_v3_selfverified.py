@@ -36,13 +36,12 @@ import argparse
 import glob
 import json
 import re
-import unicodedata
 from collections import Counter
 from pathlib import Path
 
 from finetune.curate_dataset import first_json_object, split_groups
-
-TUSSEN = {"van", "der", "den", "de", "ter", "ten", "te", "du", "le", "la", "het"}
+from finetune.namefold import TUSSENVOEGSELS as TUSSEN
+from finetune.namefold import fold
 
 OWNER_WORDS = re.compile(
     r"eigenaar|oprichter|founder|owner|directeur|director|ceo|managing partner"
@@ -50,10 +49,31 @@ OWNER_WORDS = re.compile(
     re.I,
 )
 
+# Letters that appear in real Dutch-market owner names. An ASCII-only class
+# cannot match them at all: "Michal" with a Polish l-stroke fails the [a-z]
+# tail, so the whole person match fails and the owner becomes invisible to
+# extract_owner. Turkish, Polish and German surnames are common in the
+# Netherlands, so this silently discarded a slice of every banked run.
+# Case is kept strict (uppercase initial, lowercase tail) on purpose: allowing
+# uppercase in the tail would match ALL-CAPS company names as people, and this
+# evidence is full of them.
+_UP = "A-ZÀ-ÖØ-ÞŁİŞĞĆŚŹŻČŠŽĐ"
+_LO = "a-zß-öø-ÿłışğćśźżčšžđ"
+
 # "Firstname Lastname" with optional Dutch tussenvoegsel, as it appears in
 # search snippets and LinkedIn titles.
+#
+# The tussenvoegsel run must allow TWO words, not one. "Jan van den Brom" is a
+# real owner this project has already verified by hand, and a single-word
+# particle could not match it: "den" fails the uppercase-surname class, so the
+# whole person match failed and the owner vanished. "van der", "van den" and
+# "van de" are among the most common name forms in the Netherlands, which is
+# the market this pool is drawn from. Matched case-insensitively because
+# snippets capitalise particles at the start of a sentence.
 PERSON = re.compile(
-    r"\b([A-Z][a-z]{1,20})\s+((?:van|de|der|den|ter|te|du|le|la)\s+)?([A-Z][a-z]{2,25})\b"
+    rf"\b([{_UP}][{_LO}]{{1,20}})\s+"
+    rf"((?:(?i:van|de|der|den|ter|ten|te|du|le|la|het)\s+){{0,2}})"
+    rf"([{_UP}][{_LO}]{{2,25}})\b"
 )
 
 NOT_PERSON = {
@@ -65,10 +85,6 @@ NOT_PERSON = {
     "tool", "error", "client", "found", "url", "http", "https", "web", "search",
     "linked", "linkedin", "facebook", "google", "bekijken", "profiel",
 }
-
-
-def fold(text: str) -> str:
-    return unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode().lower()
 
 
 def surname(value: str) -> str:
