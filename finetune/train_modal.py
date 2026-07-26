@@ -478,8 +478,6 @@ def serve_smoke(model: str = MODEL_NAME):
     llm = LLM(
         model=model_path,
         dtype="float16",
-        enable_auto_tool_choice=True,
-        tool_call_parser="hermes",
         max_model_len=4096,
         gpu_memory_utilization=0.9,
     )
