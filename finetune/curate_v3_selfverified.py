@@ -93,18 +93,39 @@ def surname(value: str) -> str:
     return parts[-1] if parts else ""
 
 
-def company_tokens(domain: str) -> list[str]:
+def company_tokens(domain: str, company_name: str = "") -> list[str]:
+    """Tokens that identify THIS company inside a window of evidence.
+
+    A domain that concatenates a multi-word name into one unsplittable token is
+    the common case here, not the exception: 36 pct of the v3 pool looks like
+    farmoniefarmtech.nl for "Farmonie FarmTech". Pages write the name with a
+    space, so the single token "farmoniefarmtech" never appears and the
+    company-tie test could not fire at all. Measured on the 150-company pilot
+    that alone dropped 49 rows the evidence plainly supported, including a
+    LinkedIn title reading "Directeur bij Feed Farm BV".
+
+    The extra tokens come from the company NAME but are kept only when they also
+    appear inside the domain stem. That is deliberately tight: every token is
+    still anchored to the domain, so this widens what can be RECOGNISED without
+    widening what can be CREDITED. A looser version keyed on name words alone
+    would re-open the raypack failure, where a real DGA of an entirely
+    different firm was accepted.
+    """
     stem = re.sub(r"\.(nl|com|eu|co\.uk|net|org|de|be)$", "", fold(domain))
     parts = [p for p in re.split(r"[^a-z0-9]+", stem) if len(p) > 3]
-    return parts or [stem]
+    flat = re.sub(r"[^a-z0-9]", "", stem)
+    extra = [w for w in re.split(r"[^a-z0-9]+", fold(company_name))
+             if len(w) > 3 and w in flat]
+    return sorted(set(parts + extra)) or [stem]
 
 
-def tied_to_company(evidence_raw: str, name: str, domain: str, window: int = 220) -> bool:
+def tied_to_company(evidence_raw: str, name: str, domain: str, window: int = 220,
+                    company_name: str = "") -> bool:
     key = surname(name)
     if not key:
         return False
     ev = fold(evidence_raw)
-    tokens = company_tokens(domain)
+    tokens = company_tokens(domain, company_name)
     for match in re.finditer(re.escape(key), ev):
         chunk = ev[max(0, match.start() - window): match.start() + window]
         if OWNER_WORDS.search(chunk) and any(t in chunk for t in tokens):
@@ -112,13 +133,14 @@ def tied_to_company(evidence_raw: str, name: str, domain: str, window: int = 220
     return False
 
 
-def extract_owner(evidence_raw: str, domain: str, window: int = 200) -> str | None:
+def extract_owner(evidence_raw: str, domain: str, window: int = 200,
+                  company_name: str = "") -> str | None:
     """The person the EVIDENCE calls an owner of this company, if any.
 
     Scans windows containing both an owner word and a company token, and takes
     the most frequently co-occurring plausible person name.
     """
-    tokens = company_tokens(domain)
+    tokens = company_tokens(domain, company_name)
     votes: Counter = Counter()
     for match in OWNER_WORDS.finditer(evidence_raw):
         chunk = evidence_raw[max(0, match.start() - window): match.start() + window]
@@ -148,7 +170,9 @@ def rewrite_final(final: dict, answer: dict) -> dict:
 
 
 def process(row: dict) -> tuple[dict | None, str]:
-    domain = (row.get("subject") or {}).get("domain") or ""
+    subject = row.get("subject") or {}
+    domain = subject.get("domain") or ""
+    company_name = subject.get("company_name") or ""
     preamble, groups, final = split_groups(row["messages"])
     if final is None or not groups:
         return None, "no-final"
@@ -161,10 +185,10 @@ def process(row: dict) -> tuple[dict | None, str]:
     answer, _, _ = first_json_object(final.get("content") or "")
     named = (answer or {}).get("owner_name")
 
-    if named and tied_to_company(evidence, named, domain):
+    if named and tied_to_company(evidence, named, domain, company_name=company_name):
         return row, "KEEP"
 
-    derived = extract_owner(evidence, domain)
+    derived = extract_owner(evidence, domain, company_name=company_name)
     if derived:
         fixed = dict(answer or {})
         fixed["owner_name"] = derived

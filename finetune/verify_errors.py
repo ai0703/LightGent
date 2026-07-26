@@ -42,14 +42,29 @@ OWNER_WORDS = re.compile(
 from finetune.namefold import fold, first_name, surname  # noqa: E402  (Nordic-safe)
 
 
-def company_tokens(domain: str) -> list[str]:
-    """Distinctive words from the domain, used to tie a title to THIS company."""
+def company_tokens(domain: str, company_name: str = "") -> list[str]:
+    """Distinctive words from the domain, used to tie a title to THIS company.
+
+    Domains routinely concatenate a multi-word name into one token that no page
+    ever writes: feedfarm.nl for "Feed Farm B.V.". With only that token the tie
+    test cannot fire, so a correctly identified owner ("Directeur bij Feed Farm
+    BV") was being filed as WRONG-COMPANY. That inflated exactly the error class
+    this verifier exists to size.
+
+    Extra tokens come from the company name but only when they also appear in
+    the domain stem, so every token stays anchored to the domain and the
+    raypack cross-firm case (a real DGA of a different firm) is still rejected.
+    """
     stem = re.sub(r"\.(nl|com|eu|co\.uk|net|org|de|be)$", "", fold(domain))
     parts = [p for p in re.split(r"[^a-z0-9]+", stem) if len(p) > 3]
-    return parts or [stem]
+    flat = re.sub(r"[^a-z0-9]", "", stem)
+    extra = [w for w in re.split(r"[^a-z0-9]+", fold(company_name))
+             if len(w) > 3 and w in flat]
+    return sorted(set(parts + extra)) or [stem]
 
 
-def near_owner_word(evidence: str, name: str, domain: str, window: int = 220) -> bool:
+def near_owner_word(evidence: str, name: str, domain: str, window: int = 220,
+                    company_name: str = "") -> bool:
     """Is the model's name described as an owner OF THIS COMPANY?
 
     The earlier version only asked whether an owner-word sat near the name,
@@ -60,7 +75,7 @@ def near_owner_word(evidence: str, name: str, domain: str, window: int = 220) ->
     key = surname(name)
     if not key:
         return False
-    tokens = company_tokens(domain)
+    tokens = company_tokens(domain, company_name)
     for match in re.finditer(re.escape(key), evidence):
         chunk = evidence[max(0, match.start() - window): match.start() + window]
         if OWNER_WORDS.search(chunk) and any(t in chunk for t in tokens):
@@ -68,7 +83,8 @@ def near_owner_word(evidence: str, name: str, domain: str, window: int = 220) ->
     return False
 
 
-def classify(answer: str | None, gold: list[str], evidence: str, domain: str) -> tuple[str, str]:
+def classify(answer: str | None, gold: list[str], evidence: str, domain: str,
+             company_name: str = "") -> tuple[str, str]:
     gold_in = any(g and g in evidence for g in gold)
     if not answer:
         if gold_in:
@@ -91,7 +107,7 @@ def classify(answer: str | None, gold: list[str], evidence: str, domain: str) ->
     ans_in = bool(ans_sur) and ans_sur in evidence
     if not ans_in:
         return "UNGROUNDED", "named a person who appears nowhere in the evidence"
-    if near_owner_word(evidence, answer, domain):
+    if near_owner_word(evidence, answer, domain, company_name=company_name):
         if gold_in:
             return "ALT-OWNER", "named a different person the evidence calls an owner/director (gold also present)"
         return "ALT-OWNER", "named a different person the evidence calls an owner/director; gold absent from evidence"
@@ -132,7 +148,8 @@ def main() -> None:
         evidence = fold("\n".join(
             m.get("content") or "" for m in row.get("messages", []) if m.get("role") == "tool"
         ))
-        kind, why = classify(answer, want, evidence, domain)
+        kind, why = classify(answer, want, evidence, domain,
+                             (row.get("subject") or {}).get("company_name") or "")
         buckets[kind] += 1
         if kind != "CORRECT":
             detail.append((domain, answer, want, kind, why))
