@@ -56,8 +56,12 @@ biggest source of unusable answers.
   outcome, not a crash. `/enrich-company` also returns `parse_error` when it
   succeeded but found zero people, so treat it as "no answer for this row".
 - `success` — you got data. **It is not necessarily correct.** Measured accuracy on
-  the tuned model was 65 percent as of 2026-07-26, so downstream code must treat
-  every field as a claim, not a fact. Keep the `source` URL and the `confidence`.
+  the tuned model was 65 percent as of 2026-07-26 (13 of 20), so downstream code
+  must treat every field as a claim, not a fact. Keep the `source` URL and the
+  `confidence`. **That 65 is n=20 on the dev set: the Wilson 95 percent interval
+  is 43 to 82 percent.** Do not size a business process on the point estimate as
+  though it were +/- 2 points. A sealed 60-domain test set is reserved and unspent,
+  and is the number to quote once it is run.
 
 **Do not immediately retry a `parse_error` with identical input.** It is usually
 deterministic and you will pay full cost for the same non-answer.
@@ -89,6 +93,13 @@ with an LLM call (`LLM_TIMEOUT` 180s) plus tool calls (`TOOL_TIMEOUT` 45s).
   which may legitimately wait for a lane.
 - The **first** request after startup pays ~0.85s of proxy pool construction. Fire
   one warm-up call before a batch.
+- **The warm-up is a CORRECTNESS requirement, not just a latency one.** The SearXNG
+  shards scale to zero, and a cold shard answers **HTTP 200 with an empty
+  `results` array and no `unresponsive_engines`** — indistinguishable from "nothing
+  found". Measured 2026-07-26: all three shards returned 0 results cold, then
+  21-40 results each once warm. A batch fired at cold shards produces confident
+  nulls, not errors. Warm every shard and assert a non-zero result count before
+  starting, and treat a zero-result *first* call as "not ready", never as "no data".
 - Per-fetch p50 is 1.30s and worst observed 2.71s, so a company that takes many
   minutes is stuck in the LLM loop, not in the network.
 
@@ -96,10 +107,13 @@ with an LLM call (`LLM_TIMEOUT` 180s) plus tool calls (`TOOL_TIMEOUT` 45s).
 
 **Serper is the primary search lane and it is metered.** `web_search` tries Serper
 (Google) first because result *quality* was the binding constraint. The free tier
-is 2,500 searches, and at ~9.8 searches per correct answer that is roughly 250
-companies. After that it silently falls back to the SearXNG shards, which are
-good but Google-limited. **Monitor your Serper balance; do not discover this at
-scale.**
+is 2,500 searches. Budget it at **6.35 searches per COMPANY** (127 tool calls over
+20 companies), which is roughly **390 companies**. Do not budget with the 9.8
+figure: that is searches per *correct* answer, and you pay for searches on the
+failures too, so it is the wrong denominator for capacity and under-counts by
+about a third. After the free tier it silently falls back to the SearXNG shards,
+which are good but Google-limited. **Monitor your Serper balance; do not discover
+this at scale.**
 
 **Google suspension is per SearXNG instance and asymmetric.** A 429 benches Google
 for 60s on our shards, but a CAPTCHA benches it for **seven days** by default.
