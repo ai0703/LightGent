@@ -47,7 +47,7 @@ app = FastAPI()
 
 # One semaphore per backend: codex cold-starts a session per call, so keep it
 # modest; claude -p is lighter.
-LIMITS = {"codex": asyncio.Semaphore(3), "claude": asyncio.Semaphore(4)}
+LIMITS = {"codex": asyncio.Semaphore(4), "claude": asyncio.Semaphore(8)}
 CALL_TIMEOUT = 240  # seconds per teacher decision
 
 DECISION_INSTRUCTIONS = """\

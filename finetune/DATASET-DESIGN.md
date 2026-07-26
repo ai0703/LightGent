@@ -77,19 +77,74 @@ kept evidence does not support.
 |---|---|---|
 | Curated v1 (89 rows, truncate at discovery+1, regrounded, 0 unsupported) | ~70 T1/T2, ~8 T3 | $0, done |
 | Re-bank with teacher + WORKING search (Serper tier 0), new domains from the 62.7k NL stock, sector-mixed (agri, marketing, law, accounting, real estate) | T1-T3 topup, most of T4 | see lanes below |
-| 33 hand-verified Friesland negatives (rescued-evals), banked as full teacher trajectories expecting null | core of T5 | teacher time only |
-| Apollo-contaminated domains (Apollo lists staff, gold owner differs or absent) | T6 | teacher time only |
+| **Ablation of positives** (see 5b) | all of T5 and T6 | $0, no teacher |
 | n=20 benchmark failures (model had the name, would not conclude) | rewritten as T1/T2 with correct terminus | $0, on disk |
 
-Teacher lanes, pick one:
+### 5b. Negatives come from ABLATION, not from the negatives file
 
-- **Lane A, $0, slow**: new Mistral keys (Abdul mints at console.mistral.ai,
-  free Experiment tier). Mistral Large was the ORIGINAL 98 percent teacher.
-  4 rpm means ~350 companies is an overnight run. Recommended: risk-averse,
-  fits landed-money rules.
-- **Lane B, ~$9-11, fast**: GLM-4.5-Air-FP8 on Modal 2xH100 (proven, 89 pct
-  when it answers), ~1-1.5h at C16 with Serper search. Uses nearly all of the
-  remaining $11.72 Modal allowance.
+**Correction, 2026-07-26.** `rescued-evals/negatives_to_verify.json` is NOT a
+negatives list. Checked against gold: **12 of the first 12 entries are cases
+where OUR enrichment was right and the Apollo ground-truth column was wrong**
+(abbreeding.nl found Gadret, gold says gadret, Apollo said briga/groot/
+pantophlet). It is a list of Apollo disagreements, i.e. mostly positives.
+This matches the standing rule never to score against Apollo columns, which
+list scraped staff rather than owners.
+
+Real "owner genuinely not findable" cases occur at only ~4.5 percent
+naturally (4 of 89 in v1), so harvesting 70 of them would mean banking ~1,500
+companies. Instead, synthesise them from positives, which is standard
+augmentation for teaching abstention and costs nothing:
+
+- **T5 exhausted-negative**: take a positive trajectory, replace the ONE tool
+  result that carried the owner name with a realistic barren result (empty
+  list, or a page with no names). Keep every other step and the full length.
+  Rewrite the final answer to `owner_name: null`. The trajectory now honestly
+  shows a full search that found nothing, and the correct terminal action is
+  an honest null.
+- **T6 distractor-negative**: same ablation, but choose positives whose
+  surviving evidence still names OTHER people (staff, authors, unrelated
+  profiles). Correct answer is still null. This is the direct antidote to
+  "a name is present, therefore answer it".
+
+Both are grounded by construction: the answer is null and the evidence
+genuinely lacks the owner, so no gate can be violated. Ablation targets are
+picked only from rows where the discovery step is unambiguous, so we never
+accidentally leave the name in a second result.
+
+### 5c. Teacher lanes: CLI shim, $0 marginal (SELECTED 2026-07-26)
+
+Abdul ruled out another GLM run on cost. Both affordable teachers are CLIs,
+not APIs, so `finetune/cli_teacher_shim.py` serves them over the OpenAI
+protocol the pipeline already speaks:
+
+| Lane | Teacher | Bills to | Shim concurrency |
+|---|---|---|---|
+| sol | `codex exec` gpt-5.6-sol | ChatGPT Plus flat rate | 4 |
+| haiku | `claude -p --model haiku` | Claude subscription | 8 |
+
+Running BOTH lanes in parallel roughly doubles throughput and gives teacher
+diversity, which the literature treats as a benefit rather than a defect.
+
+Three failure modes are already handled in the shim, all found by smoke test:
+
+1. **Evidence-free answers (the poison lane).** Sol recognises real companies
+   and answers from world knowledge, producing a trajectory with ZERO tool
+   results. Training on that teaches fabrication directly. The shim
+   mechanically refuses any non-tool-call reply when the transcript has no
+   tool results, and retries with an explicit rejection notice. Verified: the
+   guard converted an instant evidence-free null on vermeerboomkwekerij.nl
+   into a genuine 3-iteration, 8-tool-call deep-climb trajectory that
+   concluded correctly (Aad Vermeer).
+2. **Sloppy JSON.** Sol occasionally emits unbalanced braces; one correction
+   round trip fixes it.
+3. **Windows temp handles.** `mkstemp` keeps the file open so codex cannot
+   write to it; the shim hands codex a path inside a scratch dir instead.
+
+Codex's own `web_search` is disabled (`-c tools.web_search=false`) so every
+fact must arrive through OUR tools and therefore into the trajectory.
+
+Both lanes verified against gold on the same company (3dagroadvies.nl ->
+Diana Zoer, correct via sol and via haiku).
 
 Serper budget check: ~6 searches/company x 350 companies = ~2,100 of the
 2,500 free tier. Feasible ONLY if the teacher fetches own-site first (it
@@ -147,11 +202,15 @@ accuracy is at least 55 percent on dev. Only then spend the sealed test.
 
 ## 9. Cost summary
 
-| Lane | Banking | Train | Eval | Total |
-|---|---|---|---|---|
-| A (Mistral keys, overnight) | $0 | ~$1.40 (A100-80GB, ~25 min) | ~$0.50 (L40S) | **~$2** |
-| B (GLM on Modal) | ~$9-11 | ~$1.40 | ~$0.50 | ~$11-13, exceeds the $11.72 left |
+| Item | Cost |
+|---|---|
+| Banking via CLI shim (sol + haiku) | **$0 marginal**, subscription flat rates |
+| Negatives via ablation | $0, no teacher call |
+| Training (A100-80GB, ~25 min) | ~$1.40 |
+| Eval on L40S | ~$0.50 |
+| **Total Modal spend** | **~$2 of the $11.72 remaining** |
 
-Recommendation: Lane A. Ten minutes of Abdul minting Mistral keys converts
-the whole build to ~$2 and simultaneously clears the dead-key outage that
-blocked banking on 2026-07-26.
+No GLM run, no new API keys required. Serper stays the search tier-0 for
+banking; at ~6 searches per company the remaining free allowance covers a few
+hundred companies, and the run pauses rather than degrading if it runs out.
+Banking under broken search is what poisoned v1 and must never be repeated.
