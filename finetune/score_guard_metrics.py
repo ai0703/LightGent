@@ -28,11 +28,7 @@ from pathlib import Path
 TUSSEN = {"van", "der", "den", "de", "ter", "ten", "te", "du", "le", "la"}
 
 
-def surname(value: str) -> str:
-    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().lower()
-    parts = re.sub(r"[^a-z ]", " ", text).split()
-    core = [p for p in parts if p not in TUSSEN and len(p) > 1]
-    return core[-1] if core else (parts[-1] if parts else "")
+from finetune.namefold import fold, surname  # noqa: E402  (Nordic-safe)
 
 
 def load_gold(path: str) -> dict[str, list[str]]:

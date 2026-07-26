@@ -39,19 +39,7 @@ OWNER_WORDS = re.compile(
 )
 
 
-def fold(text: str) -> str:
-    return unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode().lower()
-
-
-def surname(value: str) -> str:
-    parts = [p for p in re.sub(r"[^a-z ]", " ", fold(value)).split()
-             if p not in TUSSEN and len(p) > 1]
-    return parts[-1] if parts else ""
-
-
-def first_name(value: str) -> str:
-    parts = [p for p in re.sub(r"[^a-z ]", " ", fold(value)).split() if len(p) > 1]
-    return parts[0] if parts else ""
+from finetune.namefold import fold, first_name, surname  # noqa: E402  (Nordic-safe)
 
 
 def company_tokens(domain: str) -> list[str]:
