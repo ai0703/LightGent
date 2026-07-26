@@ -21,6 +21,12 @@ class FakeTokenizer:
             return list(range(len(text.split())))
         return text
 
+    def __call__(self, text, add_special_tokens=False):
+        # Token counting goes through the tokenizer call, not
+        # apply_chat_template(tokenize=True), which returns a BatchEncoding
+        # in transformers 5.x.
+        return {"input_ids": list(range(len(str(text).split())))}
+
 
 def test_dry_run_never_invokes_gpu_function_or_model_weight_loader(
     tmp_path, monkeypatch

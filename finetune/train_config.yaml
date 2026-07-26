@@ -4,10 +4,13 @@ val_data: /vol/data/val.jsonl
 max_seq_len: 16384
 max_drop_frac: 0.15
 packing: false
-num_train_epochs: 2
+# 81 training rows: at grad-accum 8 and 2 epochs this is only ~20 optimizer
+# steps, too few for a LoRA to converge. 4 epochs at accum 4 gives ~80 steps.
+# Eval runs each epoch so the best checkpoint can be chosen over the last.
+num_train_epochs: 4
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 learning_rate: 0.0001
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
@@ -35,3 +38,6 @@ quantization:
   bnb_4bit_quant_type: nf4
   bnb_4bit_use_double_quant: true
   bnb_4bit_compute_dtype: bfloat16
+# Paged 8-bit optimiser: LoRA updates are small, and paging the optimiser
+# state keeps 16k-token sequences within GPU memory.
+optim: paged_adamw_8bit
