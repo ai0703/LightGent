@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
+import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -48,6 +51,7 @@ class Settings(BaseSettings):
     llm_base_urls: str = ""
     llm_api_key: str = "none"
     llm_model: str = ""
+    trajectory_log_dir: str = ""
 
     searxng_url: str = ""
     # Pool of SearXNG endpoints (comma-separated). With many Colab sessions you
@@ -93,6 +97,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 llm_semaphore = asyncio.Semaphore(settings.max_concurrent)
+trajectory_log_lock = asyncio.Lock()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────
@@ -508,12 +513,86 @@ def _strip_fabricated_urls(data: Any, seen_text: str) -> Any:
 
 # ── Agent loop ────────────────────────────────────────────────────────────
 
-async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchResponse:
-    client = AsyncOpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key or "none")
+def _response_lane(response: Any) -> Any:
+    extra = getattr(response, "model_extra", None)
+    if not isinstance(extra, dict):
+        extra = getattr(response, "__pydantic_extra__", None)
+    broker = extra.get("_broker") if isinstance(extra, dict) else None
+    return broker.get("lane") if isinstance(broker, dict) else None
+
+
+async def _write_trajectory(record: dict[str, Any], trajectory_dir: str | Path | None = None) -> None:
+    log_dir = trajectory_dir if trajectory_dir is not None else settings.trajectory_log_dir
+    if not log_dir:
+        return
+    try:
+        directory = Path(log_dir)
+        async with trajectory_log_lock:
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"trajectories-{datetime.now(timezone.utc):%Y%m%d}.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                # Durability is process-local: one service process and this module
+                # asyncio.Lock. Multi-process writers are out of scope.
+                os.fsync(handle.fileno())
+    except Exception:
+        log.exception("failed to write trajectory log")
+
+
+async def run_agent(
+    req: ResearchRequest,
+    http: httpx.AsyncClient,
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+    trajectory_dir: str | Path | None = None,
+) -> ResearchResponse:
+    resolved_base_url = settings.llm_base_url if base_url is None else base_url
+    resolved_model = settings.llm_model if model is None else model
+    resolved_api_key = settings.llm_api_key if api_key is None else api_key
+    started = time.monotonic()
+    state: dict[str, Any] = {}
+    result: ResearchResponse | None = None
+    try:
+        result = await _run_agent(
+            req, http, state, resolved_base_url, resolved_model, resolved_api_key
+        )
+        return result
+    finally:
+        resolved_trajectory_dir = (
+            settings.trajectory_log_dir if trajectory_dir is None else trajectory_dir
+        )
+        if resolved_trajectory_dir:
+            now = datetime.now(timezone.utc)
+            await _write_trajectory({
+                "ts": now.isoformat(),
+                "subject": req.context,
+                "task": req.task,
+                "fields_or_schema": req.output_fields,
+                "model": resolved_model,
+                "lane": state.get("lane"),
+                "lanes": state.get("lanes", []),
+                "status": result.status if result is not None else "error",
+                "iterations": result.iterations if result is not None else state.get("iterations", 0),
+                "tool_calls": result.tool_calls if result is not None else state.get("tool_calls", 0),
+                "duration_sec": time.monotonic() - started,
+                "messages": state.get("messages", []),
+                "final_content": state.get("final_content"),
+                "data": result.data if result is not None else None,
+            }, resolved_trajectory_dir)
+
+
+async def _run_agent(req: ResearchRequest, http: httpx.AsyncClient,
+                     state: dict[str, Any], base_url: str, model: str,
+                     api_key: str) -> ResearchResponse:
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key or "none")
     messages: list[Any] = [
         {"role": "system", "content": build_system_prompt(req.task, req.context, req.output_fields)},
         {"role": "user", "content": "Begin research now."},
     ]
+    state["messages"] = messages
 
     max_iterations = req.max_iterations or settings.max_iterations
     force_conclude_at = max(max_iterations - 3, 1)
@@ -522,6 +601,7 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
     seen_text = ""  # everything the tools returned — used to catch fabricated URLs
 
     for iteration in range(max_iterations):
+        state["iterations"] = iteration + 1
         if iteration == force_conclude_at:
             messages.append({
                 "role": "user",
@@ -532,7 +612,7 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
                 ),
             })
         kwargs: dict[str, Any] = dict(
-            model=settings.llm_model,
+            model=model,
             messages=messages,
             timeout=settings.llm_timeout,
         )
@@ -587,11 +667,17 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
                 raise
 
         msg = response.choices[0].message
+        response_lane = _response_lane(response)
+        state.setdefault("lanes", []).append(response_lane)
+        if response_lane is not None:
+            state["lane"] = response_lane
         tool_calls = _normalise_tool_calls(msg)
         if not tool_calls and msg.content:
             tool_calls = _parse_tag_tool_calls(msg.content)
 
         if not tool_calls:
+            state["final_content"] = msg.content
+            messages.append({"role": "assistant", "content": msg.content})
             data = _extract_json(msg.content or "")
             if data is None:
                 log.warning("parse_error; final content (first 600): %r",
@@ -604,6 +690,7 @@ async def run_agent(req: ResearchRequest, http: httpx.AsyncClient) -> ResearchRe
             )
 
         total_tool_calls += len(tool_calls)
+        state["tool_calls"] = total_tool_calls
         log.info("iteration %d: %d tool call(s)", iteration + 1, len(tool_calls))
         results = await asyncio.gather(*[_dispatch(tc, http) for tc in tool_calls])
         seen_text += "\n".join(results)
