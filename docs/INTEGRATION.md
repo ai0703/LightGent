@@ -119,6 +119,50 @@ this at scale.**
 for 60s on our shards, but a CAPTCHA benches it for **seven days** by default.
 Never hammer search to "warm it up".
 
+**THE ENGINE IS NAMED `google cse`, NOT `google`. Fixed 2026-07-27.** Google was
+returning zero results on every shard, costing about 60 pct of the evidence per
+query. Six configuration attempts changed nothing because they all targeted
+`- name: google`, and **no engine by that name exists** in this SearXNG build: of
+279 registered engines the Google family is `google news`, `google cse`,
+`google cse images`, `google scholar`. An unmatched engine name is a SILENT no-op,
+with no warning in the logs. The same mistake means the shard's `disabled: true`
+entries for `brave`, `startpage` and `wikipedia` never applied either, so roughly
+80 engines are enabled instead of the intended three.
+
+Three things were required together, and any one alone measures as no change:
+
+1. `- name: "google cse"` — the real engine name, quoted for the space.
+2. `retries: 3` plus `retry_on_http_error: [429, 403, 302]`. Without the latter a
+   429 is **terminal**: the engine is marked failed and suspended. With it the
+   refusal is retried, and SearXNG's docs state that *"on each retry, SearXNG uses
+   an different proxy and source ip"*. The 302 matters because Google signals bot
+   detection as a redirect to `/sorry/index`.
+3. `max_keepalive_connections: 0` and `keepalive_expiry: 0.0`, because **Proxiware
+   rotates its residential exit IP per TCP CONNECTION, not per request**. Proven:
+   one reused connection returned the same IP 9 times out of 9, while 10 fresh
+   connections returned 8 distinct IPs. With keepalive on, SearXNG pinned one
+   residential IP and Google burned it within a few queries.
+
+Also give that engine `request_timeout: 18.0` (and raise the global
+`max_request_timeout`), or three retries at ~3s each through a residential proxy
+overrun the 10s budget and fail as `Suspended: timeout` instead of succeeding on
+retry 2.
+
+Route ONLY Google through residential. Bing and DuckDuckGo measure 20/20 on the
+cheap datacenter pool and are about 2x faster there, and Jina 451s more often
+through residential exits.
+
+Measured effect across all three shards: Google availability **0 -> 80 pct
+(24/30 queries)** and median results per query **12.5 -> 33.0**. Search latency
+rises from ~1.5s to ~3-4s, which is roughly +8 pct on per-company wall clock for
+2.6x the evidence.
+
+**Operational trap: a Modal redeploy does not recycle a warm container.** Shard c
+kept serving the old build after deploy, and the giveaway was `suspended_time=60`
+in its logs where the new config says 5. Confirm a config change is live by
+grepping the logs for a value only the new build has, then `modal app stop` to
+force a cold start.
+
 **Silent quality degradation is the real failure mode, not errors.** On
 2026-07-26 a throttled search layer returned Jeffrey Epstein articles for a Dutch
 agri company, with HTTP 200 and a full result count. If you log anything, log
